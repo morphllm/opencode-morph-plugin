@@ -6,6 +6,7 @@ OpenCode plugin for [Morph SDK](https://morphllm.com) — fast apply, WarpGrep c
 
 - **Fast Apply** (`morph_edit`) — 10,500+ tok/s code editing with lazy edit markers
 - **WarpGrep** (`warpgrep_codebase_search`) — multi-turn agentic codebase search via ripgrep
+- **Proactive Compaction** — auto-compresses older messages via Morph compact before context overflow
 - **Safety guards** — pre-flight marker check, marker leakage detection, truncation detection
 - **Custom TUI** — branded titles like `Morph: src/file.ts +15/-3 (450ms)` and `WarpGrep: 5 contexts`
 - **Streaming progress** — WarpGrep shows turn-by-turn progress in the TUI during search
@@ -117,6 +118,11 @@ Returns file sections with line numbers. Use for exploratory queries. For exact 
 | `MORPH_TIMEOUT` | `30000` | Fast Apply timeout in ms |
 | `MORPH_WARP_GREP_TIMEOUT` | `60000` | WarpGrep timeout in ms |
 | `MORPH_ALLOW_READONLY_AGENTS` | `false` | Allow morph_edit in plan/explore modes |
+| `MORPH_COMPACT_URL` | `https://api.morphllm.com` | Compact API endpoint |
+| `MORPH_COMPACT_TIMEOUT` | `120000` | Compact timeout in ms |
+| `MORPH_COMPACT_CHAR_THRESHOLD` | `80000` | Character count before proactive compaction triggers |
+| `MORPH_COMPACT_PRESERVE_RECENT` | `6` | Number of recent messages to keep uncompressed |
+| `MORPH_COMPACT_RATIO` | `0.3` | Compression ratio (0.05-1.0, lower = more aggressive) |
 
 ## Safety guards
 
@@ -128,14 +134,29 @@ The plugin blocks unsafe edits before writing files:
 
 All guards return detailed errors with recovery options (retry with tighter anchors, use native `edit`, split into smaller edits).
 
+## Proactive compaction
+
+The plugin intercepts OpenCode's message pipeline via the `experimental.chat.messages.transform` hook. When total message content exceeds `MORPH_COMPACT_CHAR_THRESHOLD` (~80k chars / ~20k tokens), older messages are compressed through Morph's compact API before the LLM sees them.
+
+How it works:
+1. On each LLM call, the plugin estimates total content size across all messages
+2. If above threshold, older messages (everything except the last N) are serialized and sent to Morph compact
+3. The compacted result replaces the older messages in the context window
+4. Original messages stay in the database untouched
+5. Results are cached by message IDs to avoid redundant API calls
+
+This preempts OpenCode's built-in auto-compact (which triggers at 95% context window) and produces higher-quality compression via Morph's specialized compaction model.
+
 ## Architecture
 
-Uses the [Morph SDK](https://www.npmjs.com/package/@morphllm/morphsdk) (`MorphClient` + `WarpGrepClient`):
+Uses the [Morph SDK](https://www.npmjs.com/package/@morphllm/morphsdk) (`MorphClient` + `WarpGrepClient` + `CompactClient`):
 
 - `MorphClient` — shared config (API key, timeout, retries) for FastApply
 - `WarpGrepClient` — separate client with its own timeout for multi-turn search
+- `CompactClient` — separate client for proactive context compaction
 - `morph.fastApply.applyEdit()` — code-in/code-out merge, returns `{ mergedCode, udiff, changes }`
 - `warpGrep.execute({ streamSteps: true })` — AsyncGenerator yielding turn-by-turn progress
+- `compactClient.compact()` — message compression with configurable ratio and recent preservation
 
 ## Development
 

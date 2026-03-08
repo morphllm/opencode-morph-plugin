@@ -8,8 +8,9 @@
  */
 
 import { type Plugin, tool } from "@opencode-ai/plugin";
-import { MorphClient, WarpGrepClient } from "@morphllm/morphsdk";
-import type { WarpGrepResult } from "@morphllm/morphsdk";
+import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
+import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
+import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 
 // Config from environment
 const MORPH_API_KEY = process.env.MORPH_API_KEY;
@@ -18,6 +19,36 @@ const MORPH_TIMEOUT = parseInt(process.env.MORPH_TIMEOUT || "30000", 10);
 const MORPH_WARP_GREP_TIMEOUT = parseInt(
   process.env.MORPH_WARP_GREP_TIMEOUT || "60000",
   10,
+);
+const MORPH_COMPACT_URL =
+  process.env.MORPH_COMPACT_URL || "https://api.morphllm.com";
+const MORPH_COMPACT_TIMEOUT = parseInt(
+  process.env.MORPH_COMPACT_TIMEOUT || "120000",
+  10,
+);
+
+/**
+ * Proactive compaction config.
+ *
+ * MORPH_COMPACT_CHAR_THRESHOLD — total estimated character count across all
+ * message parts before compaction kicks in.  Default 80k chars (~20k tokens).
+ *
+ * MORPH_COMPACT_PRESERVE_RECENT — number of recent messages to keep
+ * uncompressed so the LLM has full context for the current task.
+ *
+ * MORPH_COMPACT_RATIO — target compression ratio (0.05-1.0). Lower = more
+ * aggressive compression. Default 0.3 (keep ~30% of content).
+ */
+const COMPACT_CHAR_THRESHOLD = parseInt(
+  process.env.MORPH_COMPACT_CHAR_THRESHOLD || "80000",
+  10,
+);
+const COMPACT_PRESERVE_RECENT = parseInt(
+  process.env.MORPH_COMPACT_PRESERVE_RECENT || "6",
+  10,
+);
+const COMPACT_RATIO = parseFloat(
+  process.env.MORPH_COMPACT_RATIO || "0.3",
 );
 
 /**
@@ -53,6 +84,26 @@ const warpGrep = new WarpGrepClient({
 });
 
 /**
+ * Separate CompactClient for proactive context compaction.
+ * Uses its own URL and timeout since the compact endpoint may differ.
+ */
+const compactClient = new CompactClient({
+  morphApiKey: MORPH_API_KEY,
+  morphApiUrl: MORPH_COMPACT_URL,
+  timeout: MORPH_COMPACT_TIMEOUT,
+});
+
+/**
+ * Cache for proactive compaction results.
+ * Keyed by a hash of the message IDs that were compacted,
+ * so we don't re-compact the same messages on every LLM call.
+ */
+let compactCache: {
+  messageIdHash: string;
+  result: CompactResult;
+} | null = null;
+
+/**
  * Normalize code_edit input from LLM tool calls.
  *
  * Agents frequently wrap tool arguments in markdown fences (```lang ... ```).
@@ -73,6 +124,78 @@ function normalizeCodeEditInput(codeEdit: string): string {
   }
 
   return codeEdit;
+}
+
+/**
+ * Serialize a Part into a text representation for compaction input.
+ * Tool outputs, text, and reasoning are included. Other part types are
+ * represented as brief markers to preserve structure without bulk.
+ */
+function serializePart(part: Part): string {
+  switch (part.type) {
+    case "text":
+      return (part as TextPart).text;
+    case "tool": {
+      const tp = part as ToolPart;
+      const state = tp.state;
+      if (state.status === "completed") {
+        const inputStr = JSON.stringify(state.input).slice(0, 500);
+        const outputStr = (state.output || "").slice(0, 2000);
+        return `[Tool: ${tp.tool}] ${inputStr}\nOutput: ${outputStr}`;
+      }
+      if (state.status === "error") {
+        return `[Tool: ${tp.tool}] Error: ${state.error}`;
+      }
+      return `[Tool: ${tp.tool}] ${state.status}`;
+    }
+    case "reasoning":
+      return `[Reasoning] ${(part as { text: string }).text}`;
+    default:
+      return `[${part.type}]`;
+  }
+}
+
+/**
+ * Convert OpenCode messages to the format Morph compact expects.
+ */
+function messagesToCompactInput(
+  messages: { info: Message; parts: Part[] }[],
+): { role: string; content: string }[] {
+  return messages
+    .map((m) => ({
+      role: m.info.role,
+      content: m.parts.map(serializePart).join("\n"),
+    }))
+    .filter((m) => m.content.length > 0);
+}
+
+/**
+ * Estimate total character count across all message parts.
+ */
+function estimateTotalChars(
+  messages: { info: Message; parts: Part[] }[],
+): number {
+  let total = 0;
+  for (const m of messages) {
+    for (const part of m.parts) {
+      if (part.type === "text") total += (part as TextPart).text.length;
+      else if (part.type === "tool") {
+        const tp = part as ToolPart;
+        if (tp.state.status === "completed") {
+          total += (tp.state.output || "").length;
+          total += JSON.stringify(tp.state.input).length;
+        }
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * Simple hash of message IDs for cache keying.
+ */
+function hashMessageIds(messages: { info: Message }[]): string {
+  return messages.map((m) => m.info.id).join("|");
 }
 
 /**
@@ -508,7 +631,108 @@ Try rephrasing your search term or using grep for exact keyword searches.`;
       }
     },
 
+    // Proactive compaction: compress older messages via Morph before the LLM
+    // sees them. This preempts OpenCode's built-in auto-compact (95% context).
+    // Messages stay in the DB untouched; the LLM just sees a compressed view.
+    "experimental.chat.messages.transform": async (_input, output) => {
+      if (!MORPH_API_KEY) return;
+
+      const messages = output.messages;
+      if (messages.length < COMPACT_PRESERVE_RECENT + 2) return;
+
+      const totalChars = estimateTotalChars(messages);
+      if (totalChars < COMPACT_CHAR_THRESHOLD) return;
+
+      // Split: older messages to compact, recent messages to keep intact
+      const olderMessages = messages.slice(0, -COMPACT_PRESERVE_RECENT);
+      const recentMessages = messages.slice(-COMPACT_PRESERVE_RECENT);
+
+      if (olderMessages.length === 0) return;
+
+      // Check cache — if we've already compacted these exact messages, reuse
+      const currentHash = hashMessageIds(olderMessages);
+      if (compactCache && compactCache.messageIdHash === currentHash) {
+        // Rebuild output from cached compaction
+        const compactedMsg = buildCompactedMessage(
+          olderMessages[0]!,
+          compactCache.result,
+          olderMessages.length,
+        );
+        output.messages = [compactedMsg, ...recentMessages];
+        return;
+      }
+
+      // Convert to compact API format and call Morph
+      const compactInput = messagesToCompactInput(olderMessages);
+      if (compactInput.length === 0) return;
+
+      try {
+        const result = await compactClient.compact({
+          messages: compactInput,
+          compressionRatio: COMPACT_RATIO,
+          preserveRecent: 0, // we handle preservation ourselves
+        });
+
+        // Cache the result
+        compactCache = { messageIdHash: currentHash, result };
+
+        const compactedMsg = buildCompactedMessage(
+          olderMessages[0]!,
+          result,
+          olderMessages.length,
+        );
+        output.messages = [compactedMsg, ...recentMessages];
+
+        await log(
+          "info",
+          `Compact: ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+        );
+      } catch (err) {
+        // On failure, leave messages unchanged — OpenCode's built-in compact
+        // will handle context overflow if needed
+        await log(
+          "warn",
+          `Compact failed: ${(err as Error).message}. Falling back to native compaction.`,
+        );
+      }
+    },
+
+    // When OpenCode's native compaction triggers, log it
+    "experimental.session.compacting": async (_input, output) => {
+      await log("debug", "OpenCode native compaction triggered");
+      // We could add extra context here but the proactive compaction
+      // via messages.transform should prevent this from firing often
+      output.context.push(
+        "Note: Morph compact plugin is active. Older messages may already be compressed.",
+      );
+    },
   };
 };
+
+/**
+ * Build a synthetic message containing the compacted output.
+ * Uses the first old message's metadata as a template.
+ */
+function buildCompactedMessage(
+  templateMsg: { info: Message; parts: Part[] },
+  result: CompactResult,
+  messageCount: number,
+): { info: Message; parts: Part[] } {
+  return {
+    info: {
+      ...templateMsg.info,
+      role: "user" as const,
+    } as Message,
+    parts: [
+      {
+        id: `morph-compact-${Date.now()}`,
+        sessionID: templateMsg.info.sessionID,
+        messageID: templateMsg.info.id,
+        type: "text" as const,
+        text: `[Morph Compact: ${messageCount} messages compressed, ${Math.round(result.usage.compression_ratio * 100)}% kept]\n\n${result.output}`,
+      } as TextPart,
+    ],
+  };
+}
 
 export default MorphPlugin;
