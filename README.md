@@ -94,6 +94,8 @@ export MORPH_API_KEY="sk-your-key-here"
 
 ### warpgrep_codebase_search (WarpGrep)
 
+![WarpGrep Benchmarks](assets/warpgrep-benchmarks.png)
+
 ```
   Query                               Fast agentic search
 
