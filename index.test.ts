@@ -687,7 +687,7 @@ describe("compaction integration", () => {
 
   test("proactive compaction threshold logic", () => {
     // Simulate the decision flow from experimental.chat.messages.transform
-    const THRESHOLD = 80000;
+    const THRESHOLD = 140000;
     const PRESERVE_RECENT = 6;
 
     // Below threshold — no compaction
@@ -701,7 +701,7 @@ describe("compaction integration", () => {
       makeTextMsg(
         `msg-${i}`,
         i % 2 === 0 ? "user" : "assistant",
-        "x".repeat(5000),
+        "x".repeat(8000),
       ),
     );
     expect(estimateTotalChars(largeMessages)).toBeGreaterThan(THRESHOLD);

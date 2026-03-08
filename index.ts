@@ -12,41 +12,19 @@ import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 
-// Config from environment
+// Config from environment — only MORPH_API_KEY is required
 const MORPH_API_KEY = process.env.MORPH_API_KEY;
-const MORPH_API_URL = process.env.MORPH_API_URL || "https://api.morphllm.com";
-const MORPH_TIMEOUT = parseInt(process.env.MORPH_TIMEOUT || "30000", 10);
-const MORPH_WARP_GREP_TIMEOUT = parseInt(
-  process.env.MORPH_WARP_GREP_TIMEOUT || "60000",
-  10,
-);
-const MORPH_COMPACT_URL =
-  process.env.MORPH_COMPACT_URL || "https://api.morphllm.com";
-const MORPH_COMPACT_TIMEOUT = parseInt(
-  process.env.MORPH_COMPACT_TIMEOUT || "120000",
-  10,
-);
+const MORPH_API_URL = "https://api.morphllm.com";
+const MORPH_TIMEOUT = 30000;
+const MORPH_WARP_GREP_TIMEOUT = 60000;
+const MORPH_COMPACT_TIMEOUT = 120000;
 
-/**
- * Proactive compaction config.
- *
- * MORPH_COMPACT_CHAR_THRESHOLD — total estimated character count across all
- * message parts before compaction kicks in.  Default 80k chars (~20k tokens).
- *
- * MORPH_COMPACT_PRESERVE_RECENT — number of recent messages to keep
- * uncompressed so the LLM has full context for the current task.
- *
- * MORPH_COMPACT_RATIO — target compression ratio (0.05-1.0). Lower = more
- * aggressive compression. Default 0.3 (keep ~30% of content).
- */
+// Compaction config — threshold and ratio are user-tunable
 const COMPACT_CHAR_THRESHOLD = parseInt(
-  process.env.MORPH_COMPACT_CHAR_THRESHOLD || "80000",
+  process.env.MORPH_COMPACT_CHAR_THRESHOLD || "140000",
   10,
 );
-const COMPACT_PRESERVE_RECENT = parseInt(
-  process.env.MORPH_COMPACT_PRESERVE_RECENT || "6",
-  10,
-);
+const COMPACT_PRESERVE_RECENT = 6;
 const COMPACT_RATIO = parseFloat(
   process.env.MORPH_COMPACT_RATIO || "0.3",
 );
@@ -93,11 +71,10 @@ const warpGrep = new WarpGrepClient({
 
 /**
  * Separate CompactClient for proactive context compaction.
- * Uses its own URL and timeout since the compact endpoint may differ.
  */
 const compactClient = new CompactClient({
   morphApiKey: MORPH_API_KEY,
-  morphApiUrl: MORPH_COMPACT_URL,
+  morphApiUrl: MORPH_API_URL,
   timeout: MORPH_COMPACT_TIMEOUT,
 });
 
@@ -509,9 +486,9 @@ ${udiff.slice(0, 3000)}${udiff.length > 3000 ? "\n... (truncated)" : ""}
 
   if (MORPH_WARPGREP_ENABLED) {
     tools.warpgrep_codebase_search = tool({
-        description: `Search the codebase using natural language. Multi-turn agentic search that uses ripgrep, file reading, and directory listing to find relevant code contexts.
+        description: `Fast agentic codebase search. Uses ripgrep, file reading, and directory listing across multiple turns to find relevant code contexts.
 
-Use this for semantic/exploratory searches like "Find the authentication flow", "How does error handling work", "Where is the database connection configured". Returns relevant file sections with line numbers.
+Use this for exploratory searches like "Find the authentication flow", "How does error handling work", "Where is the database connection configured". Returns relevant file sections with line numbers.
 
 For exact keyword searches (specific function names, variable names), prefer grep/ripgrep directly.`,
 

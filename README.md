@@ -7,7 +7,7 @@ OpenCode plugin for [Morph SDK](https://morphllm.com) — fast apply, WarpGrep c
 ## Features
 
 - **Fast Apply** (`morph_edit`) — 10,500+ tok/s code editing with lazy edit markers
-- **WarpGrep** (`warpgrep_codebase_search`) — multi-turn agentic codebase search via ripgrep
+- **WarpGrep** (`warpgrep_codebase_search`) — fast agentic codebase search via ripgrep (+4% SWE-Bench Pro, -15% cost)
 - **Proactive Compaction** — auto-compresses older messages via Morph compact before context overflow
 - **Safety guards** — pre-flight marker check, marker leakage detection, truncation detection
 - **Custom TUI** — branded titles like `Morph: src/file.ts +15/-3 (450ms)` and `WarpGrep: 5 contexts`
@@ -95,7 +95,7 @@ export MORPH_API_KEY="sk-your-key-here"
 ### warpgrep_codebase_search (WarpGrep)
 
 ```
-  Natural language query              Multi-turn agentic search
+  Query                               Fast agentic search
 
   "How does auth                     Turn 1: ripgrep "auth" "token" "jwt"
    middleware work?"                 Turn 2: read src/middleware/auth.ts
@@ -123,7 +123,7 @@ export MORPH_API_KEY="sk-your-key-here"
   │  ──────── older ─────────────   ── recent (6) ──  │
   └───────────────────────────────────────────────────┘
                     │                       │
-        total > 80k chars?                  │
+        total > 140k chars?                  │
                     │                       │
                     v                       │
           ┌─────────────────┐               │
@@ -164,7 +164,7 @@ function validateToken(token) {
 
 ### warpgrep_codebase_search
 
-Natural language codebase search. Multi-turn: the agent runs ripgrep, reads files, and lists directories across multiple turns to find relevant code.
+Fast agentic codebase search. The agent runs ripgrep, reads files, and lists directories across multiple turns to find relevant code. On SWE-Bench Pro, WarpGrep alone improves performance by 4% and decreases costs by 15%.
 
 ```
 warpgrep_codebase_search({
@@ -182,7 +182,7 @@ Returns file sections with line numbers. Use for exploratory queries. For exact 
 | Multiple scattered changes | `morph_edit` | Batch edits efficiently |
 | Small exact replacement | `edit` | Faster, no API call |
 | New file creation | `write` | morph_edit only edits existing files |
-| Semantic codebase search | `warpgrep_codebase_search` | Multi-turn agentic search |
+| Codebase search/exploration | `warpgrep_codebase_search` | Fast agentic search |
 | Exact keyword lookup | `grep` | Direct ripgrep, no API call |
 
 ## Configuration
@@ -190,17 +190,10 @@ Returns file sections with line numbers. Use for exploratory queries. For exact 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MORPH_API_KEY` | (required) | Your Morph API key |
-| `MORPH_API_URL` | `https://api.morphllm.com` | API endpoint |
-| `MORPH_TIMEOUT` | `30000` | Fast Apply timeout in ms |
-| `MORPH_WARP_GREP_TIMEOUT` | `60000` | WarpGrep timeout in ms |
-| `MORPH_ALLOW_READONLY_AGENTS` | `false` | Allow morph_edit in plan/explore modes |
-| `MORPH_EDIT` | `true` | Enable the `morph_edit` tool. Set to `false` to disable. |
-| `MORPH_WARPGREP` | `true` | Enable `warpgrep_codebase_search`. Set to `false` to disable. |
-| `MORPH_COMPACT` | `true` | Enable proactive compaction. Set to `false` to disable. |
-| `MORPH_COMPACT_URL` | `https://api.morphllm.com` | Compact API endpoint |
-| `MORPH_COMPACT_TIMEOUT` | `120000` | Compact timeout in ms |
-| `MORPH_COMPACT_CHAR_THRESHOLD` | `80000` | Character count before proactive compaction triggers |
-| `MORPH_COMPACT_PRESERVE_RECENT` | `6` | Number of recent messages to keep uncompressed |
+| `MORPH_EDIT` | `true` | Set to `false` to disable `morph_edit` |
+| `MORPH_WARPGREP` | `true` | Set to `false` to disable `warpgrep_codebase_search` |
+| `MORPH_COMPACT` | `true` | Set to `false` to disable proactive compaction |
+| `MORPH_COMPACT_CHAR_THRESHOLD` | `140000` | Character count before compaction triggers |
 | `MORPH_COMPACT_RATIO` | `0.3` | Compression ratio (0.05-1.0, lower = more aggressive) |
 
 ## Safety guards
@@ -215,7 +208,7 @@ All guards return detailed errors with recovery options (retry with tighter anch
 
 ## Proactive compaction
 
-The plugin intercepts OpenCode's message pipeline via the `experimental.chat.messages.transform` hook. When total message content exceeds `MORPH_COMPACT_CHAR_THRESHOLD` (~80k chars / ~20k tokens), older messages are compressed through Morph's compact API before the LLM sees them.
+The plugin intercepts OpenCode's message pipeline via the `experimental.chat.messages.transform` hook. When total message content exceeds ~140k chars (~35k tokens), older messages are compressed through Morph's compact API before the LLM sees them.
 
 How it works:
 1. On each LLM call, the plugin estimates total content size across all messages
