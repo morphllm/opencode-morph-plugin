@@ -1,6 +1,6 @@
 # opencode-morph-plugin
 
-Three tools that make [OpenCode](https://opencode.ai) agents faster, cheaper, and more accurate.
+[OpenCode](https://opencode.ai) plugin for [Morph](https://morphllm.com). Three tools:
 
 - **Fast Apply** — 10,500+ tok/s code editing with lazy markers
 - **WarpGrep** — fast agentic codebase search, +4% on SWE-Bench Pro, -15% cost
@@ -10,37 +10,59 @@ Three tools that make [OpenCode](https://opencode.ai) agents faster, cheaper, an
 
 On production repos and SWE-Bench Pro, enabling WarpGrep and compaction improves task accuracy by **6%**, reduces cost, and is net **28% faster**.
 
-## Quick start
+---
+
+## Setup
+
+### 1. Get an API key
+
+Sign up at [morphllm.com/dashboard](https://morphllm.com/dashboard/api-keys) and add it to your environment:
 
 ```bash
-# 1. Set your API key (get one at morphllm.com/dashboard)
 export MORPH_API_KEY="sk-..."
+```
 
-# 2. Add the plugin
+### 2. Install the plugin
+
+Add to `~/.config/opencode/plugin/`:
+
+```bash
 ln -s /path/to/opencode-morph-plugin/index.ts ~/.config/opencode/plugin/morph.ts
+```
 
-# 3. Add the SDK dependency
-cat > ~/.config/opencode/package.json << 'EOF'
-{ "dependencies": { "@morphllm/morphsdk": "^0.2.134" } }
-EOF
+Add the SDK dependency to `~/.config/opencode/package.json`:
 
-# 4. (Recommended) Add tool routing instructions
+```json
+{
+  "dependencies": {
+    "@morphllm/morphsdk": "^0.2.134"
+  }
+}
+```
+
+OpenCode runs `bun install` at startup to install it.
+
+> When published as an npm package: `{ "plugin": ["opencode-morph-plugin"] }`
+
+### 3. Add tool routing instructions (recommended)
+
+Copy the packaged routing policy so the LLM picks the right tool:
+
+```bash
 cp instructions/morph-tools.md ~/.config/opencode/instructions/
 ```
 
-OpenCode runs `bun install` at startup. That's it.
-
-Or, when published as an npm package:
+Then reference it in your `opencode.json`:
 
 ```json
-{ "plugin": ["opencode-morph-plugin"] }
+{
+  "instructions": ["~/.config/opencode/instructions/morph-tools.md"]
+}
 ```
 
 ---
 
-## What's inside
-
-### Fast Apply (`morph_edit`)
+## Fast Apply (`morph_edit`)
 
 10,500+ tok/s code merging. The LLM writes partial snippets with lazy markers, Morph merges them into the full file.
 
@@ -67,7 +89,7 @@ Or, when published as an npm package:
 
 Safety guards block writes when: no markers on files >10 lines, markers leak into merged output, or merged output loses >60% chars / >50% lines.
 
-### WarpGrep (`warpgrep_codebase_search`)
+## WarpGrep (`warpgrep_codebase_search`)
 
 Fast agentic codebase search. +4% accuracy on SWE-Bench Pro, -15% cost, sub-6s per query.
 
@@ -89,9 +111,9 @@ Fast agentic codebase search. +4% accuracy on SWE-Bench Pro, -15% cost, sub-6s p
                                       ...
 ```
 
-Use for exploratory queries. For exact keyword lookup, use `grep` directly.
+Use for exploratory queries ("how does X work?", "where is Y handled?"). For exact keyword lookup, use `grep` directly.
 
-### State-of-the-Art Compaction
+## State-of-the-Art Compaction
 
 25,000+ tok/s context compression in under 2 seconds. +0.6% on SWE-Bench Pro, where summarization-based compaction methods all hurt performance. Fires at 140k chars (~35k tokens), before OpenCode's built-in auto-compact (95% context window). Results cached per message set.
 
