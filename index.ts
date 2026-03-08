@@ -70,7 +70,7 @@ const warpGrep = new WarpGrepClient({
 });
 
 /**
- * Separate CompactClient for proactive context compaction.
+ * Separate CompactClient for context compaction.
  */
 const compactClient = new CompactClient({
   morphApiKey: MORPH_API_KEY,
@@ -79,7 +79,7 @@ const compactClient = new CompactClient({
 });
 
 /**
- * Cache for proactive compaction results.
+ * Cache for compaction results.
  * Keyed by a hash of the message IDs that were compacted,
  * so we don't re-compact the same messages on every LLM call.
  */
@@ -631,7 +631,7 @@ Try rephrasing your search term or using grep for exact keyword searches.`;
   };
 
   if (MORPH_COMPACT_ENABLED) {
-    // Proactive compaction: compress older messages via Morph before the LLM
+    // Compaction: compress older messages via Morph before the LLM
     // sees them. This preempts OpenCode's built-in auto-compact (95% context).
     // Messages stay in the DB untouched; the LLM just sees a compressed view.
     hooks["experimental.chat.messages.transform"] = async (_input: any, output: any) => {
@@ -700,7 +700,7 @@ Try rephrasing your search term or using grep for exact keyword searches.`;
     // When OpenCode's native compaction triggers, log it
     hooks["experimental.session.compacting"] = async (_input: any, output: any) => {
       await log("debug", "OpenCode native compaction triggered");
-      // We could add extra context here but the proactive compaction
+      // We could add extra context here but the compaction
       // via messages.transform should prevent this from firing often
       output.context.push(
         "Note: Morph compact plugin is active. Older messages may already be compressed.",

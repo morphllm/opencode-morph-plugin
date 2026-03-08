@@ -87,9 +87,9 @@ Fast agentic codebase search. +4% accuracy on SWE-Bench Pro, -15% cost, sub-6s p
 
 Use for exploratory queries. For exact keyword lookup, use `grep` directly.
 
-### Proactive Compaction
+### State-of-the-Art Compaction
 
-Sub-2s context compression. Preempts OpenCode's built-in auto-compact (95% context window) with higher-quality compression at 140k chars (~35k tokens). Results cached per message set.
+25,000+ tok/s context compression. +0.6% on SWE-Bench Pro, where summarization-based compaction methods all hurt performance. Fires at 140k chars (~35k tokens), before OpenCode's built-in auto-compact (95% context window). Results cached per message set.
 
 ```
   Every LLM call                      Only fires when context is large
