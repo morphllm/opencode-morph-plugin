@@ -1,0 +1,41 @@
+{
+  "name": "opencode-morph-plugin",
+  "version": "2.0.0",
+  "description": "OpenCode plugin for Morph SDK - fast apply, WarpGrep codebase search",
+  "type": "module",
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "instructions/"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "ci": "bun test && tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@morphllm/morphsdk": "^0.2.134"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "morph",
+    "fast-apply",
+    "warpgrep",
+    "code-search",
+    "code-editing"
+  ],
+  "author": "JRedeker",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JRedeker/opencode-morph-fast-apply.git"
+  },
+  "license": "MIT"
+}
