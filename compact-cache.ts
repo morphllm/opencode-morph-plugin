@@ -13,31 +13,30 @@ type CacheableMessage = {
   };
 };
 
-type ResultWithOutput = {
-  output: string;
-};
-
-export type SessionCompactCache<TResult = CompactResult> = {
-  sessionID: string;
+export type ChunkSummary = {
   messageCount: number;
   messageDigests: string[];
-  prefixDigest: string;
+  output: string;
+  charCountSaved: number;
+};
+
+export type SessionCompactCache = {
+  sessionID: string;
   configDigest: string;
-  result: TResult;
-  incrementalCount: number;
+  chunks: ChunkSummary[];
+  totalMessagesCompacted: number;
 };
 
 export type CompactFingerprint = {
   messageDigests: string[];
-  prefixDigest: string;
   configDigest: string;
 };
 
-export function createBoundedCompactCache<TResult>(maxSize: number) {
-  const map = new Map<string, SessionCompactCache<TResult>>();
+export function createBoundedCompactCache(maxSize: number) {
+  const map = new Map<string, SessionCompactCache>();
 
   return {
-    get(sessionID: string): SessionCompactCache<TResult> | undefined {
+    get(sessionID: string): SessionCompactCache | undefined {
       const entry = map.get(sessionID);
       if (entry) {
         map.delete(sessionID);
@@ -46,7 +45,7 @@ export function createBoundedCompactCache<TResult>(maxSize: number) {
       return entry;
     },
 
-    set(sessionID: string, entry: SessionCompactCache<TResult>) {
+    set(sessionID: string, entry: SessionCompactCache) {
       map.delete(sessionID);
       map.set(sessionID, entry);
       if (map.size > maxSize) {
@@ -65,83 +64,29 @@ export function createBoundedCompactCache<TResult>(maxSize: number) {
   };
 }
 
-export function buildCompactCacheEntry<
-  TMessage extends CacheableMessage,
-  TResult,
->(
-  messages: TMessage[],
-  result: TResult,
-  fingerprint: CompactFingerprint,
-  incrementalCount: number = 0,
-): SessionCompactCache<TResult> {
-  return {
-    sessionID: messages[0]!.info.sessionID,
-    messageCount: messages.length,
-    messageDigests: fingerprint.messageDigests,
-    prefixDigest: fingerprint.prefixDigest,
-    configDigest: fingerprint.configDigest,
-    result,
-    incrementalCount,
-  };
-}
+export function matchCacheChunks(
+  cache: SessionCompactCache,
+  messageDigests: string[]
+): {
+  matchedChunks: ChunkSummary[];
+  matchedMessageCount: number;
+} {
+  const matchedChunks: ChunkSummary[] = [];
+  let matchedMessageCount = 0;
 
-export function canReuseCompactCache<TResult>(
-  cache: SessionCompactCache<TResult>,
-  sessionID: string,
-  fingerprint: CompactFingerprint,
-): boolean {
-  return (
-    cache.sessionID === sessionID &&
-    cache.messageCount === fingerprint.messageDigests.length &&
-    cache.configDigest === fingerprint.configDigest &&
-    cache.prefixDigest === fingerprint.prefixDigest
-  );
-}
-
-export function canExtendCompactCache<TResult>(
-  cache: SessionCompactCache<TResult>,
-  sessionID: string,
-  fingerprint: CompactFingerprint,
-  maxIncrementalExtensions: number = 10,
-): boolean {
-  if (
-    cache.sessionID !== sessionID ||
-    cache.configDigest !== fingerprint.configDigest ||
-    cache.messageCount >= fingerprint.messageDigests.length
-  ) {
-    return false;
+  for (const chunk of cache.chunks) {
+    let chunkMatches = true;
+    for (let i = 0; i < chunk.messageCount; i++) {
+      if (matchedMessageCount + i >= messageDigests.length ||
+        messageDigests[matchedMessageCount + i] !== chunk.messageDigests[i]) {
+        chunkMatches = false;
+        break;
+      }
+    }
+    if (!chunkMatches) break;
+    matchedChunks.push(chunk);
+    matchedMessageCount += chunk.messageCount;
   }
 
-  if (cache.incrementalCount >= maxIncrementalExtensions) {
-    return false;
-  }
-
-  if (cache.messageDigests.length !== cache.messageCount) {
-    return false;
-  }
-
-  return cache.messageDigests.every(
-    (digest, index) => fingerprint.messageDigests[index] === digest,
-  );
-}
-
-export function buildCachedCompactInput<TResult extends ResultWithOutput>(
-  cache: SessionCompactCache<TResult>,
-): CompactInputMessage {
-  return {
-    role: "assistant",
-    content: `[Morph Compact summary of ${cache.messageCount} earlier messages]\n\n${cache.result.output}`,
-  };
-}
-
-export function buildIncrementalCompactInput<
-  TMessage extends CacheableMessage,
-  TResult extends ResultWithOutput,
->(
-  cache: SessionCompactCache<TResult>,
-  messages: TMessage[],
-  messagesToCompactInput: (messages: TMessage[]) => CompactInputMessage[],
-): CompactInputMessage[] {
-  const deltaMessages = messages.slice(cache.messageCount);
-  return [buildCachedCompactInput(cache), ...messagesToCompactInput(deltaMessages)];
+  return { matchedChunks, matchedMessageCount };
 }

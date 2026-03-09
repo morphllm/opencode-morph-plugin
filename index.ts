@@ -13,10 +13,8 @@ import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import {
-  buildCompactCacheEntry,
-  buildIncrementalCompactInput,
-  canExtendCompactCache,
-  canReuseCompactCache,
+  matchCacheChunks,
+  type ChunkSummary,
   type CompactFingerprint,
   createBoundedCompactCache,
 } from "./compact-cache";
@@ -44,8 +42,8 @@ const COMPACT_PRESERVE_RECENT = parseInt(
 const COMPACT_RATIO = parseFloat(
   process.env.MORPH_COMPACT_RATIO || "0.3",
 );
-const COMPACT_MAX_INCREMENTAL_EXTENSIONS = parseInt(
-  process.env.MORPH_COMPACT_MAX_INCREMENTAL || "10",
+const COMPACT_CHUNK_SIZE = parseInt(
+  process.env.MORPH_COMPACT_CHUNK_SIZE || "20",
   10,
 );
 
@@ -102,9 +100,9 @@ const compactClient = new CompactClient({
 });
 
 /**
- * Cache compaction state per session so we can reuse identical prefixes and
- * incrementally extend previously compacted prefixes instead of recompacting
- * the full older window on every boundary shift.
+ * Cache compaction state per session using append-only discrete chunks.
+ * Each chunk is an independent summary of a batch of messages, never
+ * re-summarized — eliminating rolling-summary drift entirely.
  *
  * Bounded LRU cache capped at MAX_COMPACT_CACHE_SESSIONS entries.
  * Both reads and writes refresh recency; the least-recently-used session
@@ -112,7 +110,7 @@ const compactClient = new CompactClient({
  */
 const MAX_COMPACT_CACHE_SESSIONS = 50;
 const compactCacheBySession =
-  createBoundedCompactCache<CompactResult>(MAX_COMPACT_CACHE_SESSIONS);
+  createBoundedCompactCache(MAX_COMPACT_CACHE_SESSIONS);
 
 /**
  * Normalize code_edit input from LLM tool calls.
@@ -215,7 +213,6 @@ function buildCompactionFingerprint(
 
   return {
     messageDigests,
-    prefixDigest: sha256(messageDigests.join("\x1e")),
     configDigest: COMPACT_CONFIG_DIGEST,
   };
 }
@@ -250,27 +247,44 @@ function messageHasInFlightToolPart(message: { parts: Part[] }): boolean {
   });
 }
 
-function shouldDeferCompaction(
+/**
+ * Find the safe compaction boundary within olderMessages.
+ * Returns the number of messages from the front that can be safely compacted.
+ *
+ * Instead of a binary defer-or-not decision, we walk backwards from the end
+ * of olderMessages to find the last settled message. Everything before it
+ * (inclusive) is safe to compact. Orphaned in-flight tool states deep in
+ * history no longer block compaction — they get serialized as
+ * "[Tool: x] pending" which Morph summarizes correctly.
+ *
+ * Returns 0 only if the entire recent window is still in-flight.
+ */
+function findSafeCompactionBoundary(
   olderMessages: { info: Message; parts: Part[] }[],
   recentMessages: { info: Message; parts: Part[] }[],
-): boolean {
-  // We only check the immediate boundary message of the older block.
-  // If we checked all of olderMessages, a single ghost "pending" tool state 
-  // from hours ago could stall compaction forever.
-  const boundaryMessage = olderMessages[olderMessages.length - 1];
-  if (boundaryMessage && messageHasInFlightToolPart(boundaryMessage)) {
-    return true;
-  }
-
-  if (recentMessages.some(messageHasInFlightToolPart)) {
-    return true;
-  }
-
+): number {
+  // If the assistant is still mid-generation or recent tools are running,
+  // defer entirely — the context is actively mutating.
   const lastMessage = recentMessages[recentMessages.length - 1];
-  return (
+  if (
     lastMessage?.info.role === "assistant" &&
     lastMessage.info.time.completed === undefined
-  );
+  ) {
+    return 0;
+  }
+  if (recentMessages.some(messageHasInFlightToolPart)) {
+    return 0;
+  }
+
+  // Walk backwards from the end of olderMessages to skip any trailing
+  // in-flight messages. We compact everything up to (including) the last
+  // settled message.
+  let boundary = olderMessages.length;
+  while (boundary > 0 && messageHasInFlightToolPart(olderMessages[boundary - 1]!)) {
+    boundary--;
+  }
+
+  return boundary;
 }
 
 /**
@@ -1138,6 +1152,11 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
     // Compaction: compress older messages via Morph before the LLM
     // sees them. This preempts OpenCode's built-in auto-compact (95% context).
     // Messages stay in the DB untouched; the LLM just sees a compressed view.
+    //
+    // Architecture: append-only discrete chunks.
+    // Each chunk is an independent summary of COMPACT_CHUNK_SIZE messages.
+    // Old chunks are never re-summarized, eliminating rolling-summary drift.
+    // Only the newest unmatched batch is sent to Morph on each cycle.
     hooks["experimental.chat.messages.transform"] = async (_input: any, output: any) => {
       if (!MORPH_API_KEY) return;
 
@@ -1152,113 +1171,109 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       const recentMessages = messages.slice(-COMPACT_PRESERVE_RECENT);
 
       if (olderMessages.length === 0) return;
-      if (shouldDeferCompaction(olderMessages, recentMessages)) return;
 
-      const sessionID = olderMessages[0]!.info.sessionID;
-      const olderFingerprint = buildCompactionFingerprint(olderMessages);
+      // Find safe boundary — skip trailing in-flight messages instead of
+      // deferring entirely. This means orphaned tool states deep in history
+      // never block compaction.
+      const safeBoundary = findSafeCompactionBoundary(olderMessages, recentMessages);
+      if (safeBoundary === 0) return;
+
+      const compactableMessages = olderMessages.slice(0, safeBoundary);
+      const skippedMessages = olderMessages.slice(safeBoundary);
+
+      const sessionID = compactableMessages[0]!.info.sessionID;
+      const fingerprint = buildCompactionFingerprint(compactableMessages);
+
+      // Check existing cache for this session
       const sessionCache = compactCacheBySession.get(sessionID);
-      if (
-        sessionCache &&
-        canReuseCompactCache(sessionCache, sessionID, olderFingerprint)
-      ) {
+      const { matchedChunks, matchedMessageCount } = sessionCache
+        ? matchCacheChunks(sessionCache, fingerprint.messageDigests)
+        : { matchedChunks: [] as ChunkSummary[], matchedMessageCount: 0 };
+
+      // If the entire compactable prefix is already cached, reuse it.
+      if (matchedMessageCount === compactableMessages.length && matchedChunks.length > 0) {
         const compactedMsg = buildCompactedMessage(
-          olderMessages[0]!,
-          sessionCache.result,
-          olderMessages.length,
+          compactableMessages[0]!,
+          matchedChunks,
+          compactableMessages.length,
           totalChars,
         );
-        output.messages = [compactedMsg, ...recentMessages];
+        output.messages = [compactedMsg, ...skippedMessages, ...recentMessages];
         return;
       }
 
-      let compactInput = messagesToCompactInput(olderMessages);
-      let compactionMode: "full" | "incremental" = "full";
+      // Determine which messages still need compaction
+      const uncachedMessages = compactableMessages.slice(matchedMessageCount);
+      if (uncachedMessages.length === 0) return;
 
-      if (
-        sessionCache &&
-        canExtendCompactCache(sessionCache, sessionID, olderFingerprint, COMPACT_MAX_INCREMENTAL_EXTENSIONS)
-      ) {
-        compactInput = buildIncrementalCompactInput(
-          sessionCache,
-          olderMessages,
-          messagesToCompactInput,
-        );
-        compactionMode = "incremental";
+      // Batch uncached messages into chunks of COMPACT_CHUNK_SIZE
+      const newChunks: ChunkSummary[] = [];
+      for (let i = 0; i < uncachedMessages.length; i += COMPACT_CHUNK_SIZE) {
+        const batch = uncachedMessages.slice(i, i + COMPACT_CHUNK_SIZE);
+        const compactInput = messagesToCompactInput(batch);
+        if (compactInput.length === 0) continue;
 
-        // The delta messages all serialized to empty content (e.g., tool parts
-        // with no output yet). Safe to reuse the prior summary because empty-content
-        // messages add no information worth re-summarizing — just advance the
-        // cache boundary metadata so future checks see the updated window.
-        if (compactInput.length === 1) {
-          compactCacheBySession.set(
-            sessionID,
-            buildCompactCacheEntry(
-              olderMessages,
-              sessionCache.result,
-              olderFingerprint,
-              sessionCache.incrementalCount,
-            ),
+        try {
+          const result = await compactClient.compact({
+            messages: compactInput,
+            compressionRatio: COMPACT_RATIO,
+            preserveRecent: 0,
+          });
+
+          const batchDigests = fingerprint.messageDigests.slice(
+            matchedMessageCount + i,
+            matchedMessageCount + i + batch.length,
           );
-          const compactedMsg = buildCompactedMessage(
-            olderMessages[0]!,
-            sessionCache.result,
-            olderMessages.length,
-            totalChars,
+
+          newChunks.push({
+            messageCount: batch.length,
+            messageDigests: batchDigests,
+            output: result.output,
+            charCountSaved: estimateTotalChars(batch) - result.output.length,
+          });
+
+          await log(
+            "info",
+            `Compact chunk: ${batch.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
           );
-          output.messages = [compactedMsg, ...recentMessages];
-          return;
+        } catch (err) {
+          // If a chunk fails, stop here — we'll use whatever we've built so far
+          // plus the raw remaining messages. Don't let one failure lose everything.
+          await log(
+            "warn",
+            `Compact chunk failed: ${(err as Error).message}. Keeping ${batch.length} messages raw.`,
+          );
+          break;
         }
       }
 
-      if (compactInput.length === 0) return;
+      const allChunks = [...matchedChunks, ...newChunks];
+      if (allChunks.length === 0) return;
 
-      try {
-        const result = await compactClient.compact({
-          messages: compactInput,
-          compressionRatio: COMPACT_RATIO,
-          preserveRecent: 0, // we handle preservation ourselves
-        });
+      // Persist updated cache
+      const totalCompactedMessages = allChunks.reduce((sum, c) => sum + c.messageCount, 0);
+      compactCacheBySession.set(sessionID, {
+        sessionID,
+        configDigest: fingerprint.configDigest,
+        chunks: allChunks,
+        totalMessagesCompacted: totalCompactedMessages,
+      });
 
-        compactCacheBySession.set(
-          sessionID,
-          buildCompactCacheEntry(
-            olderMessages,
-            result,
-            olderFingerprint,
-            compactionMode === "incremental" ? sessionCache!.incrementalCount + 1 : 0,
-          ),
-        );
+      // Any messages beyond what we successfully chunked stay raw
+      const unchunkedMessages = compactableMessages.slice(totalCompactedMessages);
 
-        const compactedMsg = buildCompactedMessage(
-          olderMessages[0]!,
-          result,
-          olderMessages.length,
-          totalChars,
-        );
-        output.messages = [compactedMsg, ...recentMessages];
+      const compactedMsg = buildCompactedMessage(
+        compactableMessages[0]!,
+        allChunks,
+        totalCompactedMessages,
+        totalChars,
+      );
+      output.messages = [compactedMsg, ...unchunkedMessages, ...skippedMessages, ...recentMessages];
 
-        await log(
-          "info",
-          `Compact (${compactionMode}): ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
-        );
-        await showToast(
-          "success",
-          compactionMode === "full"
-            ? `Context compacted in ${result.usage.processing_time_ms}ms`
-            : `Context updated in ${result.usage.processing_time_ms}ms`,
-        );
-      } catch (err) {
-        // On failure, leave messages unchanged — OpenCode's built-in compaction
-        // will handle context overflow if needed
-        await log(
-          "warn",
-          `Compact failed: ${(err as Error).message}. Falling back to native compaction.`,
-        );
-        await showToast(
-          "warning",
-          "Compaction failed, falling back to native compaction.",
-        );
-      }
+      await showToast(
+        "success",
+        `${allChunks.length} chunks (${totalCompactedMessages} msgs compacted)`,
+      );
     };
 
     // When OpenCode's native compaction triggers, log it
@@ -1276,29 +1291,32 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 };
 
 /**
- * Build a synthetic message containing the compacted output.
- * Uses the first old message's metadata as a template.
+ * Build a synthetic message containing the compacted output from discrete chunks.
+ * Each chunk's summary is concatenated with a separator — old chunks are never
+ * re-summarized, preserving fidelity across arbitrarily long sessions.
  */
 function buildCompactedMessage(
   templateMsg: { info: Message; parts: Part[] },
-  result: CompactResult,
+  chunks: ChunkSummary[],
   messageCount: number,
   originalCharCount?: number,
 ): { info: Message; parts: Part[] } {
-  const keptRatio = Math.round(result.usage.compression_ratio * 100);
-  const processingTime = result.usage.processing_time_ms;
-  const compressedCharCount = result.output.length;
+  const totalSavedChars = chunks.reduce((s, c) => s + c.charCountSaved, 0);
+  const compressedCharCount = chunks.reduce((s, c) => s + c.output.length, 0);
 
   let statsLine: string;
   if (originalCharCount !== undefined) {
-    const savedChars = originalCharCount - compressedCharCount;
-    const savedK = savedChars > 1000 ? `${Math.round(savedChars / 1000)}K` : savedChars;
+    const savedK = totalSavedChars > 1000 ? `${Math.round(totalSavedChars / 1000)}K` : totalSavedChars;
     const origK = originalCharCount > 1000 ? `${Math.round(originalCharCount / 1000)}K` : originalCharCount;
     const compK = compressedCharCount > 1000 ? `${Math.round(compressedCharCount / 1000)}K` : compressedCharCount;
-    statsLine = `[Morph Compact: ${messageCount} msgs (${origK} chars) → 1 msg (${compK} chars) | ${keptRatio}% kept, saved ${savedK} chars | ${processingTime}ms]`;
+    statsLine = `[Morph Compact: ${messageCount} msgs (${origK} chars) → ${chunks.length} chunks (${compK} chars) | saved ${savedK} chars]`;
   } else {
-    statsLine = `[Morph Compact: ${messageCount} messages compressed, ${keptRatio}% kept | ${processingTime}ms]`;
+    statsLine = `[Morph Compact: ${messageCount} messages → ${chunks.length} chunks]`;
   }
+
+  const chunkTexts = chunks.map((chunk, i) =>
+    `--- Chunk ${i + 1}/${chunks.length} (${chunk.messageCount} messages) ---\n${chunk.output}`
+  );
 
   return {
     info: {
@@ -1311,7 +1329,7 @@ function buildCompactedMessage(
         sessionID: templateMsg.info.sessionID,
         messageID: templateMsg.info.id,
         type: "text" as const,
-        text: `${statsLine}\n[Background context summary of ${messageCount} earlier messages.]\n\n${result.output}`,
+        text: `${statsLine}\n[Background context summary of ${messageCount} earlier messages.]\n\n${chunkTexts.join("\n\n")}`,
       } as TextPart,
     ],
   };
