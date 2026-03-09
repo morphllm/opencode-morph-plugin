@@ -1253,14 +1253,17 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       const allChunks = [...matchedChunks, ...newChunks];
       if (allChunks.length === 0) return;
 
-      // Persist updated cache
       const totalCompactedMessages = allChunks.reduce((sum, c) => sum + c.messageCount, 0);
-      compactCacheBySession.set(sessionID, {
-        sessionID,
-        configDigest: fingerprint.configDigest,
-        chunks: allChunks,
-        totalMessagesCompacted: totalCompactedMessages,
-      });
+
+      // Persist updated cache (only for sessions that triggered compaction)
+      if (totalChars >= COMPACT_CHAR_THRESHOLD) {
+        compactCacheBySession.set(sessionID, {
+          sessionID,
+          configDigest: fingerprint.configDigest,
+          chunks: allChunks,
+          totalMessagesCompacted: totalCompactedMessages,
+        });
+      }
 
       // Any messages beyond what we successfully chunked stay raw
       const unchunkedMessages = compactableMessages.slice(totalCompactedMessages);
