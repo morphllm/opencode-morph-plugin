@@ -20,7 +20,6 @@ const MORPH_WARP_GREP_TIMEOUT = 60000;
 const MORPH_COMPACT_TIMEOUT = 60000;
 const GITHUB_RESOLVER_TIMEOUT = 10000;
 const GITHUB_REPO_API_URL = "https://api.github.com/repos";
-const GITHUB_REPO_SEARCH_URL = "https://api.github.com/search/repositories";
 const GITHUB_REPO_SUGGESTION_LIMIT = 5;
 
 // Compaction config — threshold and ratio are user-tunable
@@ -239,7 +238,6 @@ type PublicRepoContextSearchArgs = {
 
 type ResolvedPublicRepoLocator = {
   github: string;
-  display: string;
 };
 
 type GitHubRepoSuggestion = {
@@ -268,157 +266,17 @@ type GitHubRepoLookupResult =
     };
 
 const GITHUB_OWNER_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-const GENERIC_REPO_TOKENS = new Set([
-  "app",
-  "client",
-  "code",
-  "core",
-  "docs",
-  "js",
-  "kit",
-  "lib",
-  "node",
-  "package",
-  "packages",
-  "protocol",
-  "repo",
-  "repository",
-  "sdk",
-  "server",
-  "solana",
-  "ts",
-  "typescript",
-  "web",
-]);
-const GENERIC_SEARCH_TERMS = new Set([
-  "a",
-  "an",
-  "and",
-  "are",
-  "auth",
-  "create",
-  "does",
-  "end",
-  "explain",
-  "features",
-  "find",
-  "flow",
-  "for",
-  "from",
-  "how",
-  "in",
-  "is",
-  "main",
-  "offer",
-  "offers",
-  "of",
-  "on",
-  "order",
-  "packages",
-  "placement",
-  "repo",
-  "repository",
-  "the",
-  "this",
-  "to",
-  "what",
-  "work",
-  "works",
-]);
 
-function tokenizeResolverText(text: string): string[] {
-  return Array.from(
-    new Set(
-      text
-        .toLowerCase()
-        .split(/[^a-z0-9]+/)
-        .filter((token) => token.length >= 2),
-    ),
-  );
-}
-
-function splitRepoLocator(locator: string): { owner?: string; repo?: string } {
-  const parts = locator.split("/");
-  if (parts.length !== 2) return {};
-  return { owner: parts[0]!.toLowerCase(), repo: parts[1]!.toLowerCase() };
-}
-
-function buildPublicRepoResolverQueries(
-  repo: ResolvedPublicRepoLocator,
-  searchTerm: string,
-): string[] {
-  const { owner, repo: repoName } = splitRepoLocator(repo.github);
-  const meaningfulSearchTokens = tokenizeResolverText(searchTerm)
-    .filter((token) => !GENERIC_SEARCH_TERMS.has(token))
-    .slice(0, 4);
-  const repoTokens = tokenizeResolverText(repo.github).filter(
-    (token) => !GENERIC_REPO_TOKENS.has(token),
-  );
-
-  const queries = new Set<string>();
-
-  if (owner) {
-    queries.add(`user:${owner}`);
-    if (meaningfulSearchTokens.length > 0) {
-      queries.add(`user:${owner} ${meaningfulSearchTokens.join(" ")}`);
-    }
-  }
-
-  const broadTokens = [...repoTokens, ...meaningfulSearchTokens].slice(0, 6);
-  if (broadTokens.length > 0) {
-    queries.add(broadTokens.join(" "));
-  }
-
-  if (repoName && !GENERIC_REPO_TOKENS.has(repoName)) {
-    queries.add(repoName);
-  }
-
-  return Array.from(queries);
-}
-
-function computeGitHubSuggestionScore(
-  suggestion: GitHubRepoSuggestion,
-  repo: ResolvedPublicRepoLocator,
-  searchTerm: string,
-): number {
-  const { owner, repo: repoName } = splitRepoLocator(repo.github);
-  const fullName = suggestion.fullName.toLowerCase();
-  const name = suggestion.name.toLowerCase();
-  const description = (suggestion.description || "").toLowerCase();
-  const haystack = `${fullName} ${description}`;
-  const searchTokens = tokenizeResolverText(searchTerm).filter(
-    (token) => !GENERIC_SEARCH_TERMS.has(token),
-  );
-
-  let score = Math.log10(suggestion.stars + 1);
-
-  if (owner && suggestion.ownerLogin.toLowerCase() === owner) score += 8;
-  if (repoName && name === repoName) score += 6;
-  if (repoName && !GENERIC_REPO_TOKENS.has(repoName) && name.includes(repoName)) {
-    score += 3;
-  }
-  if (fullName === repo.github.toLowerCase()) score += 20;
-
-  for (const token of searchTokens.slice(0, 4)) {
-    if (haystack.includes(token)) score += 1.5;
-  }
-
-  return score;
-}
-
-function classifyPublicRepoSearchError(error: string): "not_found" | "other" {
+function isNotFoundError(error: string): boolean {
   const normalized = error.toLowerCase();
-  if (
+  return (
     normalized.includes("not found") ||
     normalized.includes("404") ||
     normalized.includes("does not exist") ||
     normalized.includes("could not resolve") ||
     normalized.includes("failed to resolve") ||
     normalized.includes("repository resolution")
-  ) {
-    return "not_found";
-  }
-  return "other";
+  );
 }
 
 function formatPublicRepoResolutionFailure(
@@ -427,7 +285,7 @@ function formatPublicRepoResolutionFailure(
   suggestions: GitHubRepoSuggestion[] = [],
 ): string {
   const parts: string[] = [
-    `Repository resolution failed for ${repo.display}.\n\nThis locator did not resolve to a public GitHub repository that Morph can search.`,
+    `Repository resolution failed for ${repo.github}.\n\nThis locator did not resolve to a public GitHub repository that Morph can search.`,
   ];
   if (detail) parts.push(`Resolver detail: ${detail}`);
   if (suggestions.length > 0) {
@@ -481,7 +339,6 @@ If you have a full URL, use github_url instead.`,
     return {
       repo: {
         github: ownerRepo,
-        display: ownerRepo,
       },
     };
   }
@@ -542,7 +399,6 @@ Received: "${githubUrl}"`,
   return {
     repo: {
       github: canonicalRepo,
-      display: canonicalRepo,
     },
   };
 }
@@ -562,55 +418,6 @@ async function withGitHubTimeout<T>(fn: (signal: AbortSignal) => Promise<T>): Pr
   } finally {
     clearTimeout(timer);
   }
-}
-
-async function fetchGitHubRepoSuggestions(
-  repo: ResolvedPublicRepoLocator,
-  searchTerm: string,
-): Promise<GitHubRepoSuggestion[]> {
-  return withGitHubTimeout(async (signal) => {
-    const headers = githubHeaders();
-    const candidates = new Map<string, GitHubRepoSuggestion>();
-    const queries = buildPublicRepoResolverQueries(repo, searchTerm).slice(0, 3);
-
-    for (const query of queries) {
-      const url = new URL(GITHUB_REPO_SEARCH_URL);
-      url.searchParams.set("q", query);
-      url.searchParams.set("per_page", "10");
-      url.searchParams.set("sort", "stars");
-      url.searchParams.set("order", "desc");
-
-      const response = await fetch(url.toString(), { headers, signal });
-      if (!response.ok) continue;
-
-      const body = (await response.json()) as {
-        items?: Array<{
-          full_name?: string;
-          html_url?: string;
-          description?: string | null;
-          stargazers_count?: number;
-          name?: string;
-          owner?: { login?: string };
-        }>;
-      };
-
-      for (const item of body.items || []) {
-        if (!item.full_name || !item.html_url || !item.name || !item.owner?.login) continue;
-        candidates.set(item.full_name, {
-          fullName: item.full_name,
-          htmlUrl: item.html_url,
-          description: item.description || undefined,
-          stars: item.stargazers_count || 0,
-          ownerLogin: item.owner.login,
-          name: item.name,
-        });
-      }
-    }
-
-    return Array.from(candidates.values())
-      .sort((a, b) => computeGitHubSuggestionScore(b, repo, searchTerm) - computeGitHubSuggestionScore(a, repo, searchTerm))
-      .slice(0, GITHUB_REPO_SUGGESTION_LIMIT);
-  });
 }
 
 async function lookupGitHubRepository(
@@ -642,6 +449,38 @@ async function lookupGitHubRepository(
       const message = error instanceof Error ? error.message : "Unknown GitHub repo lookup error";
       return { status: "unavailable", detail: message };
     }
+  });
+}
+
+async function fetchGitHubRepoSuggestions(
+  repo: ResolvedPublicRepoLocator,
+): Promise<GitHubRepoSuggestion[]> {
+  const owner = repo.github.split("/")[0];
+  if (!owner) return [];
+  return withGitHubTimeout(async (signal) => {
+    const url = `https://api.github.com/search/repositories?q=user:${owner}&sort=stars&order=desc&per_page=5`;
+    const response = await fetch(url, { headers: githubHeaders(), signal });
+    if (!response.ok) return [];
+    const body = (await response.json()) as {
+      items?: Array<{
+        full_name?: string;
+        html_url?: string;
+        description?: string | null;
+        stargazers_count?: number;
+        name?: string;
+        owner?: { login?: string };
+      }>;
+    };
+    return (body.items || [])
+      .filter((item) => item.full_name && item.html_url && item.name && item.owner?.login)
+      .map((item) => ({
+        fullName: item.full_name!,
+        htmlUrl: item.html_url!,
+        description: item.description || undefined,
+        stars: item.stargazers_count || 0,
+        ownerLogin: item.owner!.login!,
+        name: item.name!,
+      }));
   });
 }
 
@@ -1043,7 +882,6 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           if (repoLookup.status === "not_found") {
             const suggestions = await fetchGitHubRepoSuggestions(
               repo,
-              args.search_term,
             ).catch(() => []);
             return formatPublicRepoResolutionFailure(
               repo,
@@ -1075,10 +913,9 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
             );
 
             if (!result.success) {
-              if (classifyPublicRepoSearchError(result.error || "") === "not_found") {
+              if (isNotFoundError(result.error || "")) {
                 const suggestions = await fetchGitHubRepoSuggestions(
                   repo,
-                  args.search_term,
                 ).catch(() => []);
                 return formatPublicRepoResolutionFailure(
                   repo,
@@ -1097,10 +934,9 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
               "error",
               `Public repo context search failed for ${repo.github} after ${duration}ms: ${error.message}`,
             );
-            if (classifyPublicRepoSearchError(error.message) === "not_found") {
+            if (isNotFoundError(error.message)) {
               const suggestions = await fetchGitHubRepoSuggestions(
                 repo,
-                args.search_term,
               ).catch(() => []);
               return formatPublicRepoResolutionFailure(
                 repo,
@@ -1169,7 +1005,7 @@ Try a different repository locator, a different branch, or a more specific searc
         const failMatch = output.output.match(
           /^(Search failed|WarpGrep search failed):/,
         );
-        const noResultMatch = output.output.match(/^No relevant code found/);
+        const noResultMatch = output.output.match(/^No relevant code found/m);
 
         if (failMatch) {
           output.title = "WarpGrep: search failed";
@@ -1261,7 +1097,7 @@ Try a different repository locator, a different branch, or a more specific searc
           `Compact: ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
         );
       } catch (err) {
-        // On failure, leave messages unchanged — OpenCode's built-in compact
+        // On failure, leave messages unchanged — OpenCode's built-in compaction
         // will handle context overflow if needed
         await log(
           "warn",
