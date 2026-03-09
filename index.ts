@@ -97,6 +97,9 @@ let compactCache: {
   result: CompactResult;
 } | null = null;
 
+/** How many new messages must enter the older window before we recompact */
+const COMPACT_RECOMPACT_INTERVAL = 4;
+
 /**
  * Normalize code_edit input from LLM tool calls.
  *
@@ -1052,7 +1055,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       if (olderMessages.length === 0) return;
 
-      // Check cache — if we've already compacted these exact messages, reuse
+      // Check cache — reuse if older window hasn't grown by COMPACT_RECOMPACT_INTERVAL
       const currentHash = hashMessageIds(olderMessages);
       if (compactCache && compactCache.messageIdHash === currentHash) {
         // Rebuild output from cached compaction
@@ -1063,6 +1066,20 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         );
         output.messages = [compactedMsg, ...recentMessages];
         return;
+      }
+
+      // Also reuse cache if older window grew by less than COMPACT_RECOMPACT_INTERVAL
+      if (compactCache) {
+        const cachedCount = compactCache.messageIdHash.split("|").length;
+        if (olderMessages.length - cachedCount < COMPACT_RECOMPACT_INTERVAL) {
+          const compactedMsg = buildCompactedMessage(
+            olderMessages[0]!,
+            compactCache.result,
+            olderMessages.length,
+          );
+          output.messages = [compactedMsg, ...recentMessages];
+          return;
+        }
       }
 
       // Convert to compact API format and call Morph
