@@ -66,19 +66,25 @@ export function createBoundedCompactCache(maxSize: number) {
 
 export function matchCacheChunks(
   cache: SessionCompactCache,
-  messageDigests: string[]
+  fingerprint: CompactFingerprint,
 ): {
   matchedChunks: ChunkSummary[];
   matchedMessageCount: number;
 } {
+  if (cache.configDigest !== fingerprint.configDigest) {
+    return { matchedChunks: [], matchedMessageCount: 0 };
+  }
+
   const matchedChunks: ChunkSummary[] = [];
   let matchedMessageCount = 0;
 
   for (const chunk of cache.chunks) {
     let chunkMatches = true;
     for (let i = 0; i < chunk.messageCount; i++) {
-      if (matchedMessageCount + i >= messageDigests.length ||
-        messageDigests[matchedMessageCount + i] !== chunk.messageDigests[i]) {
+      if (
+        matchedMessageCount + i >= fingerprint.messageDigests.length ||
+        fingerprint.messageDigests[matchedMessageCount + i] !== chunk.messageDigests[i]
+      ) {
         chunkMatches = false;
         break;
       }

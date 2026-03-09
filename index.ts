@@ -10,7 +10,7 @@
 import { type Plugin, tool } from "@opencode-ai/plugin";
 import { createHash } from "node:crypto";
 import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
-import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
+import type { WarpGrepResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import {
   matchCacheChunks,
@@ -1187,7 +1187,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       // Check existing cache for this session
       const sessionCache = compactCacheBySession.get(sessionID);
       const { matchedChunks, matchedMessageCount } = sessionCache
-        ? matchCacheChunks(sessionCache, fingerprint.messageDigests)
+        ? matchCacheChunks(sessionCache, fingerprint)
         : { matchedChunks: [] as ChunkSummary[], matchedMessageCount: 0 };
 
       // If the entire compactable prefix is already cached, reuse it.

@@ -3,11 +3,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CompactClient } from "@morphllm/morphsdk";
 import {
-  buildCompactCacheEntry,
-  buildIncrementalCompactInput,
-  canExtendCompactCache,
-  canReuseCompactCache,
   createBoundedCompactCache,
+  matchCacheChunks,
+  type ChunkSummary,
+  type SessionCompactCache,
 } from "./compact-cache";
 
 // These are internal to the plugin but duplicated here for testing.
@@ -412,8 +411,34 @@ function buildFakeFingerprint(
 
   return {
     messageDigests,
-    prefixDigest: messageDigests.join("\x1e"),
     configDigest,
+  };
+}
+
+function makeChunk(
+  messages: FakeMessage[],
+  output: string,
+  charCountSaved = 0,
+): ChunkSummary {
+  const fingerprint = buildFakeFingerprint(messages);
+  return {
+    messageCount: messages.length,
+    messageDigests: fingerprint.messageDigests,
+    output,
+    charCountSaved,
+  };
+}
+
+function makeSessionCache(
+  sessionID: string,
+  chunks: ChunkSummary[],
+  configDigest = "cfg-v1",
+): SessionCompactCache {
+  return {
+    sessionID,
+    configDigest,
+    chunks,
+    totalMessagesCompacted: chunks.reduce((sum, chunk) => sum + chunk.messageCount, 0),
   };
 }
 
@@ -543,6 +568,7 @@ const COMPACT_ENV_KEYS = [
   "MORPH_COMPACT",
   "MORPH_COMPACT_CHAR_THRESHOLD",
   "MORPH_COMPACT_PRESERVE_RECENT",
+  "MORPH_COMPACT_CHUNK_SIZE",
 ] as const;
 
 async function withCompactEnv<T>(
@@ -756,143 +782,113 @@ describe("estimateTotalChars", () => {
   });
 });
 
-describe("incremental compaction cache helpers", () => {
-  test("reuses cache only for the exact same older prefix", () => {
-    const older = [
+describe("chunk cache helpers", () => {
+  test("matches all cached chunks for an identical compacted prefix", () => {
+    const firstChunkMessages = [
       makeTextMsg("1", "user", "hello"),
       makeTextMsg("2", "assistant", "hi"),
     ];
-    const sessionID = older[0]!.info.sessionID;
-    const fingerprint = buildFakeFingerprint(older);
-    const cache = buildCompactCacheEntry(
-      older,
-      makeCompactResult("summary"),
-      fingerprint,
-    );
-
-    expect(canReuseCompactCache(cache, sessionID, fingerprint)).toBe(true);
-    expect(
-      canReuseCompactCache(
-        cache,
-        sessionID,
-        buildFakeFingerprint([...older, makeTextMsg("3", "user", "next")]),
-      ),
-    ).toBe(false);
-  });
-
-  test("extends cache when the older prefix grows by appending messages", () => {
-    const older = [
-      makeTextMsg("1", "user", "hello"),
-      makeTextMsg("2", "assistant", "hi"),
+    const secondChunkMessages = [
+      makeTextMsg("3", "user", "next"),
+      makeTextMsg("4", "assistant", "done"),
     ];
-    const sessionID = older[0]!.info.sessionID;
-    const cache = buildCompactCacheEntry(
-      older,
-      makeCompactResult("summary"),
-      buildFakeFingerprint(older),
-    );
-    const extended = [...older, makeTextMsg("3", "user", "next step")];
-
-    expect(
-      canExtendCompactCache(cache, sessionID, buildFakeFingerprint(extended)),
-    ).toBe(true);
-    expect(
-      buildIncrementalCompactInput(cache, extended, messagesToCompactInput),
-    ).toEqual([
-      {
-        role: "assistant",
-        content: "[Morph Compact summary of 2 earlier messages]\n\nsummary",
-      },
-      { role: "user", content: "next step" },
+    const cache = makeSessionCache("sess-1", [
+      makeChunk(firstChunkMessages, "chunk-1"),
+      makeChunk(secondChunkMessages, "chunk-2"),
     ]);
+
+    expect(
+      matchCacheChunks(
+        cache,
+        buildFakeFingerprint([...firstChunkMessages, ...secondChunkMessages]),
+      ),
+    ).toEqual({
+      matchedChunks: cache.chunks,
+      matchedMessageCount: 4,
+    });
   });
 
-  test("falls back to full compaction when the cached prefix no longer matches", () => {
-    const older = [
+  test("matches only the cached prefix when the transcript extends beyond it", () => {
+    const firstChunkMessages = [
       makeTextMsg("1", "user", "hello"),
       makeTextMsg("2", "assistant", "hi"),
     ];
-    const sessionID = older[0]!.info.sessionID;
-    const cache = buildCompactCacheEntry(
-      older,
-      makeCompactResult("summary"),
-      buildFakeFingerprint(older),
-    );
-    const differentPrefix = [
-      makeTextMsg("x", "user", "different"),
-      makeTextMsg("2", "assistant", "hi"),
+    const secondChunkMessages = [
       makeTextMsg("3", "user", "next"),
+      makeTextMsg("4", "assistant", "done"),
     ];
+    const cache = makeSessionCache("sess-1", [
+      makeChunk(firstChunkMessages, "chunk-1"),
+    ]);
 
     expect(
-      canExtendCompactCache(
+      matchCacheChunks(
         cache,
-        sessionID,
-        buildFakeFingerprint(differentPrefix),
+        buildFakeFingerprint([...firstChunkMessages, ...secondChunkMessages]),
       ),
-    ).toBe(false);
+    ).toEqual({
+      matchedChunks: cache.chunks,
+      matchedMessageCount: 2,
+    });
   });
 
-  test("does not reuse cache when middle message content changes but ids stay stable", () => {
-    const older = [
+  test("stops matching at the first mismatched chunk", () => {
+    const firstChunkMessages = [
       makeTextMsg("1", "user", "hello"),
       makeTextMsg("2", "assistant", "hi"),
+    ];
+    const secondChunkMessages = [
       makeTextMsg("3", "user", "next"),
+      makeTextMsg("4", "assistant", "done"),
     ];
-    const sessionID = older[0]!.info.sessionID;
-    const cache = buildCompactCacheEntry(
-      older,
-      makeCompactResult("summary"),
-      buildFakeFingerprint(older),
-    );
-    const editedMiddle = [
-      older[0]!,
-      {
-        ...older[1]!,
-        parts: [{ type: "text", text: "changed answer" }] as FakePart[],
-      },
-      older[2]!,
+    const editedSecondChunk = [
+      secondChunkMessages[0]!,
+      makeTextMsg("4", "assistant", "changed"),
     ];
+    const cache = makeSessionCache("sess-1", [
+      makeChunk(firstChunkMessages, "chunk-1"),
+      makeChunk(secondChunkMessages, "chunk-2"),
+    ]);
 
     expect(
-      canReuseCompactCache(
+      matchCacheChunks(
         cache,
-        sessionID,
-        buildFakeFingerprint(editedMiddle),
+        buildFakeFingerprint([...firstChunkMessages, ...editedSecondChunk]),
       ),
-    ).toBe(false);
+    ).toEqual({
+      matchedChunks: [cache.chunks[0]!],
+      matchedMessageCount: 2,
+    });
   });
 
-  test("does not reuse cache when compaction config changes", () => {
-    const older = [
+  test("does not match cached chunks when compaction config changes", () => {
+    const chunkMessages = [
       makeTextMsg("1", "user", "hello"),
       makeTextMsg("2", "assistant", "hi"),
     ];
-    const sessionID = older[0]!.info.sessionID;
-    const cache = buildCompactCacheEntry(
-      older,
-      makeCompactResult("summary"),
-      buildFakeFingerprint(older, "cfg-v1"),
+    const cache = makeSessionCache(
+      "sess-1",
+      [makeChunk(chunkMessages, "chunk-1")],
+      "cfg-v1",
     );
 
     expect(
-      canReuseCompactCache(
-        cache,
-        sessionID,
-        buildFakeFingerprint(older, "cfg-v2"),
-      ),
-    ).toBe(false);
+      matchCacheChunks(cache, buildFakeFingerprint(chunkMessages, "cfg-v2")),
+    ).toEqual({
+      matchedChunks: [],
+      matchedMessageCount: 0,
+    });
   });
 });
 
 describe("bounded LRU compact cache", () => {
   function entryForSession(sid: string) {
-    const msgs = [makeTextMsg("1", "user", "hi")];
-    msgs[0]!.info.sessionID = sid;
-    return buildCompactCacheEntry(
-      msgs,
-      makeCompactResult(`summary-${sid}`),
-      buildFakeFingerprint(msgs, `cfg-${sid}`),
+    const chunkMessages = [makeTextMsg("1", "user", "hi")];
+    chunkMessages[0]!.info.sessionID = sid;
+    return makeSessionCache(
+      sid,
+      [makeChunk(chunkMessages, `summary-${sid}`)],
+      `cfg-${sid}`,
     );
   }
 
@@ -1042,22 +1038,14 @@ describe("compaction integration", () => {
     expect(compactInput.length).toBe(14);
     expect(compactInput.every((m) => m.content.length > 0)).toBe(true);
 
-    // Incremental cache reuses exact prefixes and can extend appended ones
-    const cache = buildCompactCacheEntry(
-      older,
-      makeCompactResult("summary"),
-      buildFakeFingerprint(older),
-    );
+    const cachedChunk = makeChunk(older.slice(0, 4), "chunk-1");
+    const cache = makeSessionCache("sess-1", [cachedChunk]);
     expect(
-      canReuseCompactCache(cache, older[0]!.info.sessionID, buildFakeFingerprint(older)),
-    ).toBe(true);
-    expect(
-      canExtendCompactCache(
-        cache,
-        older[0]!.info.sessionID,
-        buildFakeFingerprint([...older, makeTextMsg("new-id", "user", "different")]),
-      ),
-    ).toBe(true);
+      matchCacheChunks(cache, buildFakeFingerprint(older)),
+    ).toEqual({
+      matchedChunks: [cachedChunk],
+      matchedMessageCount: 4,
+    });
   });
 
   test("too few messages does not trigger compaction", () => {
@@ -1074,7 +1062,7 @@ describe("compaction integration", () => {
     expect(messages.length).toBeLessThan(PRESERVE_RECENT + 2);
   });
 
-  test("plugin hook reuses exact transcript and incrementally extends older prefixes", async () => {
+  test("plugin hook reuses exact transcript and compacts only uncached chunk suffixes", async () => {
     const originalFetch = globalThis.fetch;
     const requests: Array<{ url: string; body: any }> = [];
     const toasts: Array<{ title?: string; message: string; variant: string }> = [];
@@ -1097,6 +1085,7 @@ describe("compaction integration", () => {
           MORPH_COMPACT: "true",
           MORPH_COMPACT_CHAR_THRESHOLD: "1",
           MORPH_COMPACT_PRESERVE_RECENT: "1",
+          MORPH_COMPACT_CHUNK_SIZE: "2",
         },
         async () => {
           const mod = await import(
@@ -1146,7 +1135,7 @@ describe("compaction integration", () => {
           expect(requests).toHaveLength(1);
           expect(toasts).toHaveLength(1);
           expect(toasts[0]!.variant).toBe("success");
-          expect(toasts[0]!.message).toContain("Context compacted in");
+          expect(toasts[0]!.message).toContain("1 chunks (2 msgs compacted)");
 
           const extendedMessages = [
             ...baseMessages,
@@ -1157,18 +1146,20 @@ describe("compaction integration", () => {
 
           expect(requests).toHaveLength(2);
           expect(requests[1]!.body.messages).toEqual([
-            {
-              role: "assistant",
-              content: "[Morph Compact summary of 2 earlier messages]\n\nsummary-1",
-            },
             { role: "user", content: "C".repeat(100) },
           ]);
           expect(
-            logs.some((entry) => entry.message.includes("Compact (incremental)")),
+            logs.some((entry) => entry.message.includes("Compact chunk: 1 messages")),
           ).toBe(true);
           expect(toasts).toHaveLength(2);
           expect(toasts[1]!.variant).toBe("success");
-          expect(toasts[1]!.message).toContain("Context updated in");
+          expect(toasts[1]!.message).toContain("2 chunks (3 msgs compacted)");
+          expect(thirdOutput.messages[0]!.parts[0]!.text).toContain(
+            "--- Chunk 1/2 (2 messages) ---",
+          );
+          expect(thirdOutput.messages[0]!.parts[0]!.text).toContain(
+            "--- Chunk 2/2 (1 messages) ---",
+          );
         },
       );
     } finally {
@@ -1200,6 +1191,7 @@ describe("compaction integration", () => {
           MORPH_COMPACT: "true",
           MORPH_COMPACT_CHAR_THRESHOLD: "1",
           MORPH_COMPACT_PRESERVE_RECENT: "1",
+          MORPH_COMPACT_CHUNK_SIZE: "2",
         },
         async () => {
           const mod = await import(
@@ -1243,7 +1235,7 @@ describe("compaction integration", () => {
     }
   });
 
-  test("plugin hook defers compaction when the compaction boundary ends on an in-flight tool call", async () => {
+  test("plugin hook skips trailing in-flight older messages and compacts the settled prefix", async () => {
     const originalFetch = globalThis.fetch;
     const requests: Array<{ url: string; body: any }> = [];
 
@@ -1265,6 +1257,7 @@ describe("compaction integration", () => {
           MORPH_COMPACT: "true",
           MORPH_COMPACT_CHAR_THRESHOLD: "1",
           MORPH_COMPACT_PRESERVE_RECENT: "1",
+          MORPH_COMPACT_CHUNK_SIZE: "2",
         },
         async () => {
           const mod = await import(
@@ -1294,7 +1287,10 @@ describe("compaction integration", () => {
             },
           );
 
-          expect(requests).toHaveLength(0);
+          expect(requests).toHaveLength(1);
+          expect(requests[0]!.body.messages).toEqual([
+            { role: "user", content: "A".repeat(100) },
+          ]);
         },
       );
     } finally {
@@ -1324,6 +1320,7 @@ describe("compaction integration", () => {
           MORPH_COMPACT: "true",
           MORPH_COMPACT_CHAR_THRESHOLD: "1",
           MORPH_COMPACT_PRESERVE_RECENT: "1",
+          MORPH_COMPACT_CHUNK_SIZE: "2",
         },
         async () => {
           const mod = await import(
