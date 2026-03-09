@@ -297,14 +297,13 @@ function formatPublicRepoResolutionFailure(
   suggestions: GitHubRepoSuggestion[] = [],
 ): string {
   const parts: string[] = [
-    `Repository resolution failed for ${repo}.\n\nThis locator did not resolve to a public GitHub repository that Morph can search.`,
+    `Repository not found: ${repo}\n\nThis repository does not exist or is private. Do NOT keep guessing other repo names.`,
   ];
-  if (detail) parts.push(`Resolver detail: ${detail}`);
   if (suggestions.length > 0) {
     const list = suggestions.map((s) => `- ${s.fullName}${s.description ? ` - ${s.description}` : ""}`).join("\n");
-    parts.push(`Did you mean:\n${list}\n\nSuggested next step:\nRetry warpgrep_github_search with owner_repo="${suggestions[0]!.fullName}".`);
+    parts.push(`Public repos found under this org:\n${list}\n\nIf one of these looks right, retry with that owner_repo.`);
   }
-  parts.push(`Try:\n- owner_repo: "owner/repo"\n- github_url: "https://github.com/owner/repo"\n- verify the owner and repo spelling\n- use the canonical upstream repository instead of a package name or import path`);
+  parts.push(`If the SDK is closed-source or private:\n- Check the npm package page (https://www.npmjs.com/package/<package-name>) for a repository link\n- The real source repo may be under a different org or name\n- Stop trying variations and report that the source is not publicly available`);
   return parts.join("\n\n");
 }
 
