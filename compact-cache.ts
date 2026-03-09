@@ -1,16 +1,7 @@
-import type { CompactResult } from "@morphllm/morphsdk";
-
 export type CompactInputMessage = {
   role: string;
   content: string;
   name?: string;
-};
-
-type CacheableMessage = {
-  info: {
-    sessionID: string;
-    id: string;
-  };
 };
 
 export type ChunkSummary = {

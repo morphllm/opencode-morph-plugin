@@ -386,6 +386,27 @@ function serializePart(part: FakePart): string {
   }
 }
 
+function serializePartForFingerprint(part: FakePart): string {
+  switch (part.type) {
+    case "text":
+      return part.text;
+    case "tool": {
+      const state = part.state;
+      if (state.status === "completed") {
+        return `[Tool: ${part.tool}] ${JSON.stringify(state.input)}\nOutput: ${state.output || ""}`;
+      }
+      if (state.status === "error") {
+        return `[Tool: ${part.tool}] Error: ${state.error}`;
+      }
+      return `[Tool: ${part.tool}] ${state.status}`;
+    }
+    case "reasoning":
+      return "";
+    default:
+      return `[${part.type}]`;
+  }
+}
+
 function messagesToCompactInput(
   messages: FakeMessage[],
 ): { role: string; content: string }[] {
@@ -405,7 +426,7 @@ function buildFakeFingerprint(
     JSON.stringify({
       id: message.info.id,
       role: message.info.role,
-      content: message.parts.map(serializePart).filter(Boolean),
+      content: message.parts.map(serializePartForFingerprint).filter(Boolean),
     }),
   );
 
@@ -506,11 +527,11 @@ function makeTextMsg(
   const info =
     role === "assistant"
       ? {
-          id,
-          role,
-          sessionID: "sess-1",
-          time: { created: 1, completed: 2 },
-        }
+        id,
+        role,
+        sessionID: "sess-1",
+        time: { created: 1, completed: 2 },
+      }
       : { id, role, sessionID: "sess-1" };
 
   return {
@@ -532,16 +553,16 @@ function makeToolMsg(
       ? { status: "completed", input: state.input, output: state.output }
       : state.status === "running"
         ? {
-            status: "running",
-            input: state.input ?? {},
-            title: state.title,
-            time: { start: 1 },
-          }
+          status: "running",
+          input: state.input ?? {},
+          title: state.title,
+          time: { start: 1 },
+        }
         : {
-            status: "pending",
-            input: state.input ?? {},
-            raw: state.raw ?? "",
-          };
+          status: "pending",
+          input: state.input ?? {},
+          raw: state.raw ?? "",
+        };
 
   return {
     info: {
@@ -569,6 +590,7 @@ const COMPACT_ENV_KEYS = [
   "MORPH_COMPACT_CHAR_THRESHOLD",
   "MORPH_COMPACT_PRESERVE_RECENT",
   "MORPH_COMPACT_CHUNK_SIZE",
+  "MORPH_COMPACT_MIN_UNCACHED_CHARS",
 ] as const;
 
 async function withCompactEnv<T>(
@@ -806,6 +828,25 @@ describe("chunk cache helpers", () => {
       matchedChunks: cache.chunks,
       matchedMessageCount: 4,
     });
+  });
+
+  test("full fingerprinting distinguishes long tool outputs with the same truncated prefix", () => {
+    const sharedPrefix = "x".repeat(2000);
+    const first = makeToolMsg("1", "read", {
+      status: "completed",
+      input: { path: "/tmp/file-a.ts" },
+      output: `${sharedPrefix}-alpha`,
+    });
+    const second = makeToolMsg("1", "read", {
+      status: "completed",
+      input: { path: "/tmp/file-a.ts" },
+      output: `${sharedPrefix}-beta`,
+    });
+
+    expect(serializePart(first.parts[0]!)).toBe(serializePart(second.parts[0]!));
+    expect(buildFakeFingerprint([first]).messageDigests[0]).not.toBe(
+      buildFakeFingerprint([second]).messageDigests[0],
+    );
   });
 
   test("matches only the cached prefix when the transcript extends beyond it", () => {
@@ -1086,6 +1127,7 @@ describe("compaction integration", () => {
           MORPH_COMPACT_CHAR_THRESHOLD: "1",
           MORPH_COMPACT_PRESERVE_RECENT: "1",
           MORPH_COMPACT_CHUNK_SIZE: "2",
+          MORPH_COMPACT_MIN_UNCACHED_CHARS: "1",
         },
         async () => {
           const mod = await import(
@@ -1201,7 +1243,7 @@ describe("compaction integration", () => {
           const hooks = await plugin({
             directory: import.meta.dir,
             client: {
-              app: { log: async () => {} },
+              app: { log: async () => { } },
               tui: {
                 showToast: async ({ body }: any) => {
                   toasts.push(body);
@@ -1258,6 +1300,7 @@ describe("compaction integration", () => {
           MORPH_COMPACT_CHAR_THRESHOLD: "1",
           MORPH_COMPACT_PRESERVE_RECENT: "1",
           MORPH_COMPACT_CHUNK_SIZE: "2",
+          MORPH_COMPACT_MIN_UNCACHED_CHARS: "1",
         },
         async () => {
           const mod = await import(
@@ -1267,7 +1310,7 @@ describe("compaction integration", () => {
           const hooks = await plugin({
             directory: import.meta.dir,
             client: {
-              app: { log: async () => {} },
+              app: { log: async () => { } },
             },
           });
 
@@ -1298,7 +1341,7 @@ describe("compaction integration", () => {
     }
   });
 
-  test("plugin hook keeps compaction cache isolated per session", async () => {
+  test("plugin hook does not cache unstable history in the middle of the compactable prefix", async () => {
     const originalFetch = globalThis.fetch;
     const requests: Array<{ url: string; body: any }> = [];
 
@@ -1321,61 +1364,102 @@ describe("compaction integration", () => {
           MORPH_COMPACT_CHAR_THRESHOLD: "1",
           MORPH_COMPACT_PRESERVE_RECENT: "1",
           MORPH_COMPACT_CHUNK_SIZE: "2",
+          MORPH_COMPACT_MIN_UNCACHED_CHARS: "1",
         },
         async () => {
           const mod = await import(
-            `./index.ts?compaction-session-test=${Date.now()}-${Math.random()}`
+            `./index.ts?compaction-unstable-middle-test=${Date.now()}-${Math.random()}`
           );
           const plugin = mod.default;
           const hooks = await plugin({
             directory: import.meta.dir,
             client: {
-              app: { log: async () => {} },
+              app: { log: async () => { } },
             },
           });
 
           const transform = hooks["experimental.chat.messages.transform"];
-          const sessionOne = [
-            {
-              ...makeTextMsg("1", "user", "A".repeat(100)),
-              info: { id: "1", role: "user" as const, sessionID: "s1" },
-            },
-            {
-              ...makeTextMsg("2", "assistant", "B".repeat(100)),
-              info: { id: "2", role: "assistant" as const, sessionID: "s1" },
-            },
-            {
-              ...makeTextMsg("3", "user", "C".repeat(100)),
-              info: { id: "3", role: "user" as const, sessionID: "s1" },
-            },
-          ];
-          const sessionTwo = [
-            {
-              ...makeTextMsg("1", "user", "A".repeat(100)),
-              info: { id: "1", role: "user" as const, sessionID: "s2" },
-            },
-            {
-              ...makeTextMsg("2", "assistant", "B".repeat(100)),
-              info: { id: "2", role: "assistant" as const, sessionID: "s2" },
-            },
-            {
-              ...makeTextMsg("3", "user", "C".repeat(100)),
-              info: { id: "3", role: "user" as const, sessionID: "s2" },
-            },
+          const transcript = [
+            makeTextMsg("1", "user", "A".repeat(100)),
+            makeToolMsg("2", "read", {
+              status: "pending",
+              input: { path: "/tmp/file.ts" },
+              raw: "{\"path\":\"/tmp/file.ts\"}",
+            }),
+            makeTextMsg("3", "assistant", "C".repeat(100)),
+            makeTextMsg("4", "user", "D".repeat(100)),
           ];
 
-          await transform({}, { messages: structuredClone(sessionOne) });
-          await transform({}, { messages: structuredClone(sessionTwo) });
-
-          expect(requests).toHaveLength(2);
+          const firstOutput = { messages: structuredClone(transcript) };
+          await transform({}, firstOutput);
+          expect(requests).toHaveLength(1);
           expect(requests[0]!.body.messages).toEqual([
             { role: "user", content: "A".repeat(100) },
-            { role: "assistant", content: "B".repeat(100) },
           ]);
-          expect(requests[1]!.body.messages).toEqual([
-            { role: "user", content: "A".repeat(100) },
-            { role: "assistant", content: "B".repeat(100) },
+          expect(firstOutput.messages[1]!.parts[0]!.type).toBe("tool");
+          expect(firstOutput.messages[2]!.parts[0]!.type).toBe("text");
+
+          const secondOutput = { messages: structuredClone(transcript) };
+          await transform({}, secondOutput);
+          expect(requests).toHaveLength(1);
+        },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("plugin hook serializes same-session compaction work", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: any }> = [];
+
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      requests.push({ url, body });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      return new Response(JSON.stringify(makeCompactResult("summary-1")), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    try {
+      await withCompactEnv(
+        {
+          MORPH_API_KEY: "sk-test-key",
+          MORPH_COMPACT: "true",
+          MORPH_COMPACT_CHAR_THRESHOLD: "1",
+          MORPH_COMPACT_PRESERVE_RECENT: "1",
+          MORPH_COMPACT_CHUNK_SIZE: "2",
+          MORPH_COMPACT_MIN_UNCACHED_CHARS: "1",
+        },
+        async () => {
+          const mod = await import(
+            `./index.ts?compaction-lock-test=${Date.now()}-${Math.random()}`
+          );
+          const plugin = mod.default;
+          const hooks = await plugin({
+            directory: import.meta.dir,
+            client: {
+              app: { log: async () => { } },
+            },
+          });
+
+          const transform = hooks["experimental.chat.messages.transform"];
+          const transcript = [
+            makeTextMsg("1", "user", "A".repeat(100)),
+            makeTextMsg("2", "assistant", "B".repeat(100)),
+            makeTextMsg("3", "user", "C".repeat(100)),
+          ];
+
+          await Promise.all([
+            transform({}, { messages: structuredClone(transcript) }),
+            transform({}, { messages: structuredClone(transcript) }),
           ]);
+
+          expect(requests).toHaveLength(1);
         },
       );
     } finally {

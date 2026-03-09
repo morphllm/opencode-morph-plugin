@@ -46,6 +46,10 @@ const COMPACT_CHUNK_SIZE = parseInt(
   process.env.MORPH_COMPACT_CHUNK_SIZE || "20",
   10,
 );
+const COMPACT_MIN_UNCACHED_CHARS = parseInt(
+  process.env.MORPH_COMPACT_MIN_UNCACHED_CHARS || "16000",
+  10,
+);
 
 /**
  * Feature flags — users can disable specific capabilities.
@@ -111,6 +115,34 @@ const compactClient = new CompactClient({
 const MAX_COMPACT_CACHE_SESSIONS = 50;
 const compactCacheBySession =
   createBoundedCompactCache(MAX_COMPACT_CACHE_SESSIONS);
+const compactSessionLocks = new Map<string, Promise<void>>();
+
+async function withSessionCompactionLock<T>(
+  sessionID: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = compactSessionLocks.get(sessionID) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(
+    () => current,
+    () => current,
+  );
+  compactSessionLocks.set(sessionID, queued);
+
+  await previous;
+
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (compactSessionLocks.get(sessionID) === queued) {
+      compactSessionLocks.delete(sessionID);
+    }
+  }
+}
 
 /**
  * Normalize code_edit input from LLM tool calls.
@@ -151,6 +183,28 @@ function serializePart(part: Part): string {
         const inputStr = JSON.stringify(state.input).slice(0, 500);
         const outputStr = (state.output || "").slice(0, 2000);
         return `[Tool: ${tp.tool}] ${inputStr}\nOutput: ${outputStr}`;
+      }
+      if (state.status === "error") {
+        return `[Tool: ${tp.tool}] Error: ${state.error}`;
+      }
+      return `[Tool: ${tp.tool}] ${state.status}`;
+    }
+    case "reasoning":
+      return "";
+    default:
+      return `[${part.type}]`;
+  }
+}
+
+function serializePartForFingerprint(part: Part): string {
+  switch (part.type) {
+    case "text":
+      return (part as TextPart).text;
+    case "tool": {
+      const tp = part as ToolPart;
+      const state = tp.state;
+      if (state.status === "completed") {
+        return `[Tool: ${tp.tool}] ${JSON.stringify(state.input)}\nOutput: ${state.output || ""}`;
       }
       if (state.status === "error") {
         return `[Tool: ${tp.tool}] Error: ${state.error}`;
@@ -206,7 +260,7 @@ function buildCompactionFingerprint(
       JSON.stringify({
         id: message.info.id,
         role: message.info.role,
-        content: message.parts.map(serializePart).filter(Boolean),
+        content: message.parts.map(serializePartForFingerprint).filter(Boolean),
       }),
     ),
   );
@@ -245,6 +299,13 @@ function messageHasInFlightToolPart(message: { parts: Part[] }): boolean {
     const state = (part as ToolPart).state;
     return state.status === "pending" || state.status === "running";
   });
+}
+
+function findStableCompactionPrefixLength(
+  messages: { parts: Part[] }[],
+): number {
+  const firstUnstableIndex = messages.findIndex(messageHasInFlightToolPart);
+  return firstUnstableIndex === -1 ? messages.length : firstUnstableIndex;
 }
 
 /**
@@ -1180,106 +1241,154 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       const compactableMessages = olderMessages.slice(0, safeBoundary);
       const skippedMessages = olderMessages.slice(safeBoundary);
+      const stablePrefixLength = findStableCompactionPrefixLength(compactableMessages);
+      if (stablePrefixLength === 0) return;
 
-      const sessionID = compactableMessages[0]!.info.sessionID;
-      const fingerprint = buildCompactionFingerprint(compactableMessages);
+      const stableCompactableMessages = compactableMessages.slice(0, stablePrefixLength);
+      const unstableHistoryMessages = compactableMessages.slice(stablePrefixLength);
+      const sessionID = stableCompactableMessages[0]!.info.sessionID;
 
-      // Check existing cache for this session
-      const sessionCache = compactCacheBySession.get(sessionID);
-      const { matchedChunks, matchedMessageCount } = sessionCache
-        ? matchCacheChunks(sessionCache, fingerprint)
-        : { matchedChunks: [] as ChunkSummary[], matchedMessageCount: 0 };
+      await withSessionCompactionLock(sessionID, async () => {
+        if (unstableHistoryMessages.length > 0) {
+          await log(
+            "debug",
+            `Skipping ${unstableHistoryMessages.length} unstable messages from cacheable compaction prefix for session ${sessionID}`,
+          );
+        }
 
-      // If the entire compactable prefix is already cached, reuse it.
-      if (matchedMessageCount === compactableMessages.length && matchedChunks.length > 0) {
+        const fingerprint = buildCompactionFingerprint(stableCompactableMessages);
+
+        // Check existing cache for this session
+        const sessionCache = compactCacheBySession.get(sessionID);
+        const { matchedChunks, matchedMessageCount } = sessionCache
+          ? matchCacheChunks(sessionCache, fingerprint)
+          : { matchedChunks: [] as ChunkSummary[], matchedMessageCount: 0 };
+
+        // If the entire compactable prefix is already cached, reuse it.
+        if (
+          matchedMessageCount === stableCompactableMessages.length &&
+          matchedChunks.length > 0
+        ) {
+          const compactedMsg = buildCompactedMessage(
+            stableCompactableMessages[0]!,
+            matchedChunks,
+            stableCompactableMessages.length,
+            totalChars,
+          );
+          output.messages = [
+            compactedMsg,
+            ...unstableHistoryMessages,
+            ...skippedMessages,
+            ...recentMessages,
+          ];
+          return;
+        }
+
+        // Determine which messages still need compaction
+        const uncachedMessages = stableCompactableMessages.slice(matchedMessageCount);
+        if (uncachedMessages.length === 0) return;
+
+        const uncachedChars = estimateTotalChars(uncachedMessages);
+        if (uncachedChars < COMPACT_MIN_UNCACHED_CHARS) {
+          if (matchedChunks.length > 0) {
+            const compactedMsg = buildCompactedMessage(
+              stableCompactableMessages[0]!,
+              matchedChunks,
+              matchedMessageCount,
+              totalChars,
+            );
+            output.messages = [
+              compactedMsg,
+              ...stableCompactableMessages.slice(matchedMessageCount),
+              ...unstableHistoryMessages,
+              ...skippedMessages,
+              ...recentMessages,
+            ];
+          }
+          return;
+        }
+
+        // Batch uncached messages into chunks of COMPACT_CHUNK_SIZE
+        const newChunks: ChunkSummary[] = [];
+        let totalCompactTime = 0;
+        for (let i = 0; i < uncachedMessages.length; i += COMPACT_CHUNK_SIZE) {
+          const batch = uncachedMessages.slice(i, i + COMPACT_CHUNK_SIZE);
+          const compactInput = messagesToCompactInput(batch);
+          if (compactInput.length === 0) continue;
+
+          try {
+            const result = await compactClient.compact({
+              messages: compactInput,
+              compressionRatio: COMPACT_RATIO,
+              preserveRecent: 0,
+            });
+
+            const batchDigests = fingerprint.messageDigests.slice(
+              matchedMessageCount + i,
+              matchedMessageCount + i + batch.length,
+            );
+
+            newChunks.push({
+              messageCount: batch.length,
+              messageDigests: batchDigests,
+              output: result.output,
+              charCountSaved: estimateTotalChars(batch) - result.output.length,
+            });
+
+            totalCompactTime += result.usage.processing_time_ms;
+
+            await log(
+              "info",
+              `Compact chunk: ${batch.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+            );
+          } catch (err) {
+            // If a chunk fails, stop here — we'll use whatever we've built so far
+            // plus the raw remaining messages. Don't let one failure lose everything.
+            await log(
+              "warn",
+              `Compact chunk failed: ${(err as Error).message}. Keeping ${batch.length} messages raw.`,
+            );
+            break;
+          }
+        }
+
+        const allChunks = [...matchedChunks, ...newChunks];
+        if (allChunks.length === 0) return;
+
+        const totalCompactedMessages = allChunks.reduce((sum, c) => sum + c.messageCount, 0);
+
+        // Persist updated cache (only for sessions that triggered compaction)
+        if (totalChars >= COMPACT_CHAR_THRESHOLD) {
+          compactCacheBySession.set(sessionID, {
+            sessionID,
+            configDigest: fingerprint.configDigest,
+            chunks: allChunks,
+            totalMessagesCompacted: totalCompactedMessages,
+          });
+        }
+
+        // Any messages beyond what we successfully chunked stay raw
+        const unchunkedMessages = stableCompactableMessages.slice(totalCompactedMessages);
+
         const compactedMsg = buildCompactedMessage(
-          compactableMessages[0]!,
-          matchedChunks,
-          compactableMessages.length,
+          stableCompactableMessages[0]!,
+          allChunks,
+          totalCompactedMessages,
           totalChars,
         );
-        output.messages = [compactedMsg, ...skippedMessages, ...recentMessages];
-        return;
-      }
+        output.messages = [
+          compactedMsg,
+          ...unchunkedMessages,
+          ...unstableHistoryMessages,
+          ...skippedMessages,
+          ...recentMessages,
+        ];
 
-      // Determine which messages still need compaction
-      const uncachedMessages = compactableMessages.slice(matchedMessageCount);
-      if (uncachedMessages.length === 0) return;
-
-      // Batch uncached messages into chunks of COMPACT_CHUNK_SIZE
-      const newChunks: ChunkSummary[] = [];
-      let totalCompactTime = 0;
-      for (let i = 0; i < uncachedMessages.length; i += COMPACT_CHUNK_SIZE) {
-        const batch = uncachedMessages.slice(i, i + COMPACT_CHUNK_SIZE);
-        const compactInput = messagesToCompactInput(batch);
-        if (compactInput.length === 0) continue;
-
-        try {
-          const result = await compactClient.compact({
-            messages: compactInput,
-            compressionRatio: COMPACT_RATIO,
-            preserveRecent: 0,
-          });
-
-          const batchDigests = fingerprint.messageDigests.slice(
-            matchedMessageCount + i,
-            matchedMessageCount + i + batch.length,
-          );
-
-          newChunks.push({
-            messageCount: batch.length,
-            messageDigests: batchDigests,
-            output: result.output,
-            charCountSaved: estimateTotalChars(batch) - result.output.length,
-          });
-
-          totalCompactTime += result.usage.processing_time_ms;
-
-          await log(
-            "info",
-            `Compact chunk: ${batch.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
-          );
-        } catch (err) {
-          // If a chunk fails, stop here — we'll use whatever we've built so far
-          // plus the raw remaining messages. Don't let one failure lose everything.
-          await log(
-            "warn",
-            `Compact chunk failed: ${(err as Error).message}. Keeping ${batch.length} messages raw.`,
-          );
-          break;
-        }
-      }
-
-      const allChunks = [...matchedChunks, ...newChunks];
-      if (allChunks.length === 0) return;
-
-      const totalCompactedMessages = allChunks.reduce((sum, c) => sum + c.messageCount, 0);
-
-      // Persist updated cache (only for sessions that triggered compaction)
-      if (totalChars >= COMPACT_CHAR_THRESHOLD) {
-        compactCacheBySession.set(sessionID, {
-          sessionID,
-          configDigest: fingerprint.configDigest,
-          chunks: allChunks,
-          totalMessagesCompacted: totalCompactedMessages,
-        });
-      }
-
-      // Any messages beyond what we successfully chunked stay raw
-      const unchunkedMessages = compactableMessages.slice(totalCompactedMessages);
-
-      const compactedMsg = buildCompactedMessage(
-        compactableMessages[0]!,
-        allChunks,
-        totalCompactedMessages,
-        totalChars,
-      );
-      output.messages = [compactedMsg, ...unchunkedMessages, ...skippedMessages, ...recentMessages];
-
-      await showToast(
-        "success",
-        `${allChunks.length} chunks (${totalCompactedMessages} msgs compacted) | ${totalCompactTime}ms`,
-      );
+        await showToast(
+          "success",
+          `${allChunks.length} chunks (${totalCompactedMessages} msgs compacted) | ${totalCompactTime}ms`,
+        );
+      });
     };
 
     // When OpenCode's native compaction triggers, log it
