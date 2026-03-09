@@ -566,7 +566,7 @@ const MorphPlugin: Plugin = async ({ directory, client }) => {
     duration = 2000,
   ) => {
     try {
-      await client.tui.showToast({
+      await client.tui?.showToast({
         body: {
           title,
           message,
@@ -1127,8 +1127,10 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         );
         compactionMode = "incremental";
 
-        // New messages crossed into the older window but had no compactable content.
-        // Reuse the prior summary and just advance the cache boundary metadata.
+        // The delta messages all serialized to empty content (e.g., tool parts
+        // with no output yet). Safe to reuse the prior summary because empty-content
+        // messages add no information worth re-summarizing — just advance the
+        // cache boundary metadata so future checks see the updated window.
         if (compactInput.length === 1) {
           compactCacheBySession.set(
             sessionID,

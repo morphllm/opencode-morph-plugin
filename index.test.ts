@@ -519,6 +519,35 @@ function makeToolMsg(
   };
 }
 
+const COMPACT_ENV_KEYS = [
+  "MORPH_API_KEY",
+  "MORPH_COMPACT",
+  "MORPH_COMPACT_CHAR_THRESHOLD",
+  "MORPH_COMPACT_PRESERVE_RECENT",
+] as const;
+
+async function withCompactEnv<T>(
+  overrides: Record<string, string>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of COMPACT_ENV_KEYS) {
+    saved[key] = process.env[key];
+  }
+  Object.assign(process.env, overrides);
+  try {
+    return await fn();
+  } finally {
+    for (const key of COMPACT_ENV_KEYS) {
+      if (saved[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = saved[key];
+      }
+    }
+  }
+}
+
 describe("serializePart", () => {
   test("serializes text part", () => {
     expect(serializePart({ type: "text", text: "hello world" })).toBe(
@@ -944,112 +973,83 @@ describe("compaction integration", () => {
       });
     };
 
-    const originalEnv = {
-      MORPH_API_KEY: process.env.MORPH_API_KEY,
-      MORPH_COMPACT: process.env.MORPH_COMPACT,
-      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
-      MORPH_COMPACT_PRESERVE_RECENT:
-        process.env.MORPH_COMPACT_PRESERVE_RECENT,
-    };
-
-    process.env.MORPH_API_KEY = "sk-test-key";
-    process.env.MORPH_COMPACT = "true";
-    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
-    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
-
     try {
-      const mod = await import(
-        `./index.ts?compaction-hook-test=${Date.now()}-${Math.random()}`
-      );
-      const plugin = mod.default;
-      const logs: any[] = [];
-      const hooks = await plugin({
-        directory: import.meta.dir,
-        client: {
-          app: {
-            log: async ({ body }: any) => {
-              logs.push(body);
-            },
-          },
-          tui: {
-            showToast: async ({ body }: any) => {
-              toasts.push(body);
-            },
-          },
-        },
-      });
-
-      const transform = hooks["experimental.chat.messages.transform"];
-      expect(typeof transform).toBe("function");
-
-      const baseMessages = [
-        makeTextMsg("1", "user", "A".repeat(100)),
-        makeTextMsg("2", "assistant", "B".repeat(100)),
-        makeTextMsg("3", "user", "C".repeat(100)),
-      ];
-
-      const firstOutput = { messages: structuredClone(baseMessages) };
-      await transform({}, firstOutput);
-      expect(requests).toHaveLength(1);
-      expect(requests[0]!.body.messages).toEqual([
-        { role: "user", content: "A".repeat(100) },
-        { role: "assistant", content: "B".repeat(100) },
-      ]);
-
-      const secondOutput = { messages: structuredClone(baseMessages) };
-      await transform({}, secondOutput);
-      expect(requests).toHaveLength(1);
-      expect(toasts).toHaveLength(1);
-      expect(toasts[0]!.variant).toBe("success");
-      expect(toasts[0]!.message).toContain("Context compacted in");
-
-      const extendedMessages = [
-        ...baseMessages,
-        makeTextMsg("4", "assistant", "D".repeat(100)),
-      ];
-      const thirdOutput = { messages: structuredClone(extendedMessages) };
-      await transform({}, thirdOutput);
-
-      expect(requests).toHaveLength(2);
-      expect(requests[1]!.body.messages).toEqual([
+      await withCompactEnv(
         {
-          role: "user",
-          content: "[Morph Compact summary of 2 earlier messages]\n\nsummary-1",
+          MORPH_API_KEY: "sk-test-key",
+          MORPH_COMPACT: "true",
+          MORPH_COMPACT_CHAR_THRESHOLD: "1",
+          MORPH_COMPACT_PRESERVE_RECENT: "1",
         },
-        { role: "user", content: "C".repeat(100) },
-      ]);
-      expect(
-        logs.some((entry) => entry.message.includes("Compact (incremental)")),
-      ).toBe(true);
-      expect(toasts).toHaveLength(1);
+        async () => {
+          const mod = await import(
+            `./index.ts?compaction-hook-test=${Date.now()}-${Math.random()}`
+          );
+          const plugin = mod.default;
+          const logs: any[] = [];
+          const hooks = await plugin({
+            directory: import.meta.dir,
+            client: {
+              app: {
+                log: async ({ body }: any) => {
+                  logs.push(body);
+                },
+              },
+              tui: {
+                showToast: async ({ body }: any) => {
+                  toasts.push(body);
+                },
+              },
+            },
+          });
+
+          const transform = hooks["experimental.chat.messages.transform"];
+          expect(typeof transform).toBe("function");
+
+          const baseMessages = [
+            makeTextMsg("1", "user", "A".repeat(100)),
+            makeTextMsg("2", "assistant", "B".repeat(100)),
+            makeTextMsg("3", "user", "C".repeat(100)),
+          ];
+
+          const firstOutput = { messages: structuredClone(baseMessages) };
+          await transform({}, firstOutput);
+          expect(requests).toHaveLength(1);
+          expect(requests[0]!.body.messages).toEqual([
+            { role: "user", content: "A".repeat(100) },
+            { role: "assistant", content: "B".repeat(100) },
+          ]);
+
+          const secondOutput = { messages: structuredClone(baseMessages) };
+          await transform({}, secondOutput);
+          expect(requests).toHaveLength(1);
+          expect(toasts).toHaveLength(1);
+          expect(toasts[0]!.variant).toBe("success");
+          expect(toasts[0]!.message).toContain("Context compacted in");
+
+          const extendedMessages = [
+            ...baseMessages,
+            makeTextMsg("4", "assistant", "D".repeat(100)),
+          ];
+          const thirdOutput = { messages: structuredClone(extendedMessages) };
+          await transform({}, thirdOutput);
+
+          expect(requests).toHaveLength(2);
+          expect(requests[1]!.body.messages).toEqual([
+            {
+              role: "user",
+              content: "[Morph Compact summary of 2 earlier messages]\n\nsummary-1",
+            },
+            { role: "user", content: "C".repeat(100) },
+          ]);
+          expect(
+            logs.some((entry) => entry.message.includes("Compact (incremental)")),
+          ).toBe(true);
+          expect(toasts).toHaveLength(1);
+        },
+      );
     } finally {
       globalThis.fetch = originalFetch;
-
-      if (originalEnv.MORPH_API_KEY === undefined) {
-        delete process.env.MORPH_API_KEY;
-      } else {
-        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
-      }
-
-      if (originalEnv.MORPH_COMPACT === undefined) {
-        delete process.env.MORPH_COMPACT;
-      } else {
-        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
-      }
-
-      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
-        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
-      } else {
-        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
-          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
-      }
-
-      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
-        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
-      } else {
-        process.env.MORPH_COMPACT_PRESERVE_RECENT =
-          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
-      }
     }
   });
 
@@ -1070,82 +1070,53 @@ describe("compaction integration", () => {
       });
     };
 
-    const originalEnv = {
-      MORPH_API_KEY: process.env.MORPH_API_KEY,
-      MORPH_COMPACT: process.env.MORPH_COMPACT,
-      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
-      MORPH_COMPACT_PRESERVE_RECENT:
-        process.env.MORPH_COMPACT_PRESERVE_RECENT,
-    };
-
-    process.env.MORPH_API_KEY = "sk-test-key";
-    process.env.MORPH_COMPACT = "true";
-    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
-    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
-
     try {
-      const mod = await import(
-        `./index.ts?compaction-pending-tool-test=${Date.now()}-${Math.random()}`
-      );
-      const plugin = mod.default;
-      const hooks = await plugin({
-        directory: import.meta.dir,
-        client: {
-          app: { log: async () => {} },
-          tui: {
-            showToast: async ({ body }: any) => {
-              toasts.push(body);
-            },
-          },
-        },
-      });
-
-      const transform = hooks["experimental.chat.messages.transform"];
-      await transform(
-        {},
+      await withCompactEnv(
         {
-          messages: structuredClone([
-            makeTextMsg("1", "user", "A".repeat(100)),
-            makeTextMsg("2", "assistant", "B".repeat(100)),
-            makeToolMsg("3", "read", {
-              status: "running",
-              input: { path: "/tmp/file.ts" },
-              title: "Reading file",
-            }),
-          ]),
+          MORPH_API_KEY: "sk-test-key",
+          MORPH_COMPACT: "true",
+          MORPH_COMPACT_CHAR_THRESHOLD: "1",
+          MORPH_COMPACT_PRESERVE_RECENT: "1",
+        },
+        async () => {
+          const mod = await import(
+            `./index.ts?compaction-pending-tool-test=${Date.now()}-${Math.random()}`
+          );
+          const plugin = mod.default;
+          const hooks = await plugin({
+            directory: import.meta.dir,
+            client: {
+              app: { log: async () => {} },
+              tui: {
+                showToast: async ({ body }: any) => {
+                  toasts.push(body);
+                },
+              },
+            },
+          });
+
+          const transform = hooks["experimental.chat.messages.transform"];
+          await transform(
+            {},
+            {
+              messages: structuredClone([
+                makeTextMsg("1", "user", "A".repeat(100)),
+                makeTextMsg("2", "assistant", "B".repeat(100)),
+                makeToolMsg("3", "read", {
+                  status: "running",
+                  input: { path: "/tmp/file.ts" },
+                  title: "Reading file",
+                }),
+              ]),
+            },
+          );
+
+          expect(requests).toHaveLength(0);
+          expect(toasts).toHaveLength(0);
         },
       );
-
-      expect(requests).toHaveLength(0);
-      expect(toasts).toHaveLength(0);
     } finally {
       globalThis.fetch = originalFetch;
-
-      if (originalEnv.MORPH_API_KEY === undefined) {
-        delete process.env.MORPH_API_KEY;
-      } else {
-        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
-      }
-
-      if (originalEnv.MORPH_COMPACT === undefined) {
-        delete process.env.MORPH_COMPACT;
-      } else {
-        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
-      }
-
-      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
-        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
-      } else {
-        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
-          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
-      }
-
-      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
-        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
-      } else {
-        process.env.MORPH_COMPACT_PRESERVE_RECENT =
-          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
-      }
     }
   });
 
@@ -1164,76 +1135,47 @@ describe("compaction integration", () => {
       });
     };
 
-    const originalEnv = {
-      MORPH_API_KEY: process.env.MORPH_API_KEY,
-      MORPH_COMPACT: process.env.MORPH_COMPACT,
-      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
-      MORPH_COMPACT_PRESERVE_RECENT:
-        process.env.MORPH_COMPACT_PRESERVE_RECENT,
-    };
-
-    process.env.MORPH_API_KEY = "sk-test-key";
-    process.env.MORPH_COMPACT = "true";
-    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
-    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
-
     try {
-      const mod = await import(
-        `./index.ts?compaction-boundary-tool-test=${Date.now()}-${Math.random()}`
-      );
-      const plugin = mod.default;
-      const hooks = await plugin({
-        directory: import.meta.dir,
-        client: {
-          app: { log: async () => {} },
-        },
-      });
-
-      const transform = hooks["experimental.chat.messages.transform"];
-      await transform(
-        {},
+      await withCompactEnv(
         {
-          messages: structuredClone([
-            makeTextMsg("1", "user", "A".repeat(100)),
-            makeToolMsg("2", "read", {
-              status: "pending",
-              input: { path: "/tmp/file.ts" },
-              raw: "{\"path\":\"/tmp/file.ts\"}",
-            }),
-            makeTextMsg("3", "user", "C".repeat(100)),
-          ]),
+          MORPH_API_KEY: "sk-test-key",
+          MORPH_COMPACT: "true",
+          MORPH_COMPACT_CHAR_THRESHOLD: "1",
+          MORPH_COMPACT_PRESERVE_RECENT: "1",
+        },
+        async () => {
+          const mod = await import(
+            `./index.ts?compaction-boundary-tool-test=${Date.now()}-${Math.random()}`
+          );
+          const plugin = mod.default;
+          const hooks = await plugin({
+            directory: import.meta.dir,
+            client: {
+              app: { log: async () => {} },
+            },
+          });
+
+          const transform = hooks["experimental.chat.messages.transform"];
+          await transform(
+            {},
+            {
+              messages: structuredClone([
+                makeTextMsg("1", "user", "A".repeat(100)),
+                makeToolMsg("2", "read", {
+                  status: "pending",
+                  input: { path: "/tmp/file.ts" },
+                  raw: "{\"path\":\"/tmp/file.ts\"}",
+                }),
+                makeTextMsg("3", "user", "C".repeat(100)),
+              ]),
+            },
+          );
+
+          expect(requests).toHaveLength(0);
         },
       );
-
-      expect(requests).toHaveLength(0);
     } finally {
       globalThis.fetch = originalFetch;
-
-      if (originalEnv.MORPH_API_KEY === undefined) {
-        delete process.env.MORPH_API_KEY;
-      } else {
-        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
-      }
-
-      if (originalEnv.MORPH_COMPACT === undefined) {
-        delete process.env.MORPH_COMPACT;
-      } else {
-        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
-      }
-
-      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
-        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
-      } else {
-        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
-          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
-      }
-
-      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
-        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
-      } else {
-        process.env.MORPH_COMPACT_PRESERVE_RECENT =
-          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
-      }
     }
   });
 
@@ -1252,101 +1194,72 @@ describe("compaction integration", () => {
       });
     };
 
-    const originalEnv = {
-      MORPH_API_KEY: process.env.MORPH_API_KEY,
-      MORPH_COMPACT: process.env.MORPH_COMPACT,
-      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
-      MORPH_COMPACT_PRESERVE_RECENT:
-        process.env.MORPH_COMPACT_PRESERVE_RECENT,
-    };
-
-    process.env.MORPH_API_KEY = "sk-test-key";
-    process.env.MORPH_COMPACT = "true";
-    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
-    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
-
     try {
-      const mod = await import(
-        `./index.ts?compaction-session-test=${Date.now()}-${Math.random()}`
+      await withCompactEnv(
+        {
+          MORPH_API_KEY: "sk-test-key",
+          MORPH_COMPACT: "true",
+          MORPH_COMPACT_CHAR_THRESHOLD: "1",
+          MORPH_COMPACT_PRESERVE_RECENT: "1",
+        },
+        async () => {
+          const mod = await import(
+            `./index.ts?compaction-session-test=${Date.now()}-${Math.random()}`
+          );
+          const plugin = mod.default;
+          const hooks = await plugin({
+            directory: import.meta.dir,
+            client: {
+              app: { log: async () => {} },
+            },
+          });
+
+          const transform = hooks["experimental.chat.messages.transform"];
+          const sessionOne = [
+            {
+              ...makeTextMsg("1", "user", "A".repeat(100)),
+              info: { id: "1", role: "user" as const, sessionID: "s1" },
+            },
+            {
+              ...makeTextMsg("2", "assistant", "B".repeat(100)),
+              info: { id: "2", role: "assistant" as const, sessionID: "s1" },
+            },
+            {
+              ...makeTextMsg("3", "user", "C".repeat(100)),
+              info: { id: "3", role: "user" as const, sessionID: "s1" },
+            },
+          ];
+          const sessionTwo = [
+            {
+              ...makeTextMsg("1", "user", "A".repeat(100)),
+              info: { id: "1", role: "user" as const, sessionID: "s2" },
+            },
+            {
+              ...makeTextMsg("2", "assistant", "B".repeat(100)),
+              info: { id: "2", role: "assistant" as const, sessionID: "s2" },
+            },
+            {
+              ...makeTextMsg("3", "user", "C".repeat(100)),
+              info: { id: "3", role: "user" as const, sessionID: "s2" },
+            },
+          ];
+
+          await transform({}, { messages: structuredClone(sessionOne) });
+          await transform({}, { messages: structuredClone(sessionTwo) });
+
+          expect(requests).toHaveLength(2);
+          expect(requests[0]!.body.messages).toEqual([
+            { role: "user", content: "A".repeat(100) },
+            { role: "assistant", content: "B".repeat(100) },
+          ]);
+          expect(requests[1]!.body.messages).toEqual([
+            { role: "user", content: "A".repeat(100) },
+            { role: "assistant", content: "B".repeat(100) },
+          ]);
+        },
       );
-      const plugin = mod.default;
-      const hooks = await plugin({
-        directory: import.meta.dir,
-        client: {
-          app: { log: async () => {} },
-        },
-      });
-
-      const transform = hooks["experimental.chat.messages.transform"];
-      const sessionOne = [
-        {
-          ...makeTextMsg("1", "user", "A".repeat(100)),
-          info: { id: "1", role: "user" as const, sessionID: "s1" },
-        },
-        {
-          ...makeTextMsg("2", "assistant", "B".repeat(100)),
-          info: { id: "2", role: "assistant" as const, sessionID: "s1" },
-        },
-        {
-          ...makeTextMsg("3", "user", "C".repeat(100)),
-          info: { id: "3", role: "user" as const, sessionID: "s1" },
-        },
-      ];
-      const sessionTwo = [
-        {
-          ...makeTextMsg("1", "user", "A".repeat(100)),
-          info: { id: "1", role: "user" as const, sessionID: "s2" },
-        },
-        {
-          ...makeTextMsg("2", "assistant", "B".repeat(100)),
-          info: { id: "2", role: "assistant" as const, sessionID: "s2" },
-        },
-        {
-          ...makeTextMsg("3", "user", "C".repeat(100)),
-          info: { id: "3", role: "user" as const, sessionID: "s2" },
-        },
-      ];
-
-      await transform({}, { messages: structuredClone(sessionOne) });
-      await transform({}, { messages: structuredClone(sessionTwo) });
-
-      expect(requests).toHaveLength(2);
-      expect(requests[0]!.body.messages).toEqual([
-        { role: "user", content: "A".repeat(100) },
-        { role: "assistant", content: "B".repeat(100) },
-      ]);
-      expect(requests[1]!.body.messages).toEqual([
-        { role: "user", content: "A".repeat(100) },
-        { role: "assistant", content: "B".repeat(100) },
-      ]);
     } finally {
       globalThis.fetch = originalFetch;
-
-      if (originalEnv.MORPH_API_KEY === undefined) {
-        delete process.env.MORPH_API_KEY;
-      } else {
-        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
-      }
-
-      if (originalEnv.MORPH_COMPACT === undefined) {
-        delete process.env.MORPH_COMPACT;
-      } else {
-        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
-      }
-
-      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
-        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
-      } else {
-        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
-          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
-      }
-
-      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
-        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
-      } else {
-        process.env.MORPH_COMPACT_PRESERVE_RECENT =
-          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
-      }
     }
   });
 });
