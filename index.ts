@@ -195,6 +195,34 @@ function estimateTotalChars(
   return total;
 }
 
+function messageHasInFlightToolPart(message: { parts: Part[] }): boolean {
+  return message.parts.some((part) => {
+    if (part.type !== "tool") return false;
+    const state = (part as ToolPart).state;
+    return state.status === "pending" || state.status === "running";
+  });
+}
+
+function shouldDeferCompaction(
+  olderMessages: { info: Message; parts: Part[] }[],
+  recentMessages: { info: Message; parts: Part[] }[],
+): boolean {
+  const boundaryMessage = olderMessages[olderMessages.length - 1];
+  if (boundaryMessage && messageHasInFlightToolPart(boundaryMessage)) {
+    return true;
+  }
+
+  if (recentMessages.some(messageHasInFlightToolPart)) {
+    return true;
+  }
+
+  const lastMessage = recentMessages[recentMessages.length - 1];
+  return (
+    lastMessage?.info.role === "assistant" &&
+    lastMessage.info.time.completed === undefined
+  );
+}
+
 /**
  * Format WarpGrep results for tool output
  */
@@ -528,6 +556,26 @@ const MorphPlugin: Plugin = async ({ directory, client }) => {
       });
     } catch {
       process.stderr.write(`[morph] ${message}\n`);
+    }
+  };
+
+  const showToast = async (
+    variant: "info" | "success" | "warning" | "error",
+    message: string,
+    title = "Morph Compact",
+    duration = 2000,
+  ) => {
+    try {
+      await client.tui.showToast({
+        body: {
+          title,
+          message,
+          variant,
+          duration,
+        },
+      });
+    } catch {
+      // TUI feedback is best-effort; keep compaction non-blocking.
     }
   };
 
@@ -1054,6 +1102,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       const recentMessages = messages.slice(-COMPACT_PRESERVE_RECENT);
 
       if (olderMessages.length === 0) return;
+      if (shouldDeferCompaction(olderMessages, recentMessages)) return;
 
       const sessionID = olderMessages[0]!.info.sessionID;
       const sessionCache = compactCacheBySession.get(sessionID);
@@ -1120,12 +1169,22 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           "info",
           `Compact (${compactionMode}): ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
         );
+        if (compactionMode === "full") {
+          await showToast(
+            "success",
+            `Context compacted in ${result.usage.processing_time_ms}ms`,
+          );
+        }
       } catch (err) {
         // On failure, leave messages unchanged — OpenCode's built-in compaction
         // will handle context overflow if needed
         await log(
           "warn",
           `Compact failed: ${(err as Error).message}. Falling back to native compaction.`,
+        );
+        await showToast(
+          "warning",
+          "Compaction failed, falling back to native compaction.",
         );
       }
     };

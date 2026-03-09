@@ -355,7 +355,12 @@ type FakePart =
   | { type: "file"; filename: string };
 
 type FakeMessage = {
-  info: { id: string; role: "user" | "assistant"; sessionID: string };
+  info: {
+    id: string;
+    role: "user" | "assistant";
+    sessionID: string;
+    time?: { created: number; completed?: number };
+  };
   parts: FakePart[];
 };
 
@@ -454,8 +459,18 @@ function makeTextMsg(
   role: "user" | "assistant",
   text: string,
 ): FakeMessage {
+  const info =
+    role === "assistant"
+      ? {
+          id,
+          role,
+          sessionID: "sess-1",
+          time: { created: 1, completed: 2 },
+        }
+      : { id, role, sessionID: "sess-1" };
+
   return {
-    info: { id, role, sessionID: "sess-1" },
+    info,
     parts: [{ type: "text", text }],
   };
 }
@@ -463,16 +478,42 @@ function makeTextMsg(
 function makeToolMsg(
   id: string,
   toolName: string,
-  input: any,
-  output: string,
+  state:
+    | { status: "completed"; input: any; output: string }
+    | { status: "pending"; input?: any; raw?: string }
+    | { status: "running"; input?: any; title?: string },
 ): FakeMessage {
+  const toolState =
+    state.status === "completed"
+      ? { status: "completed", input: state.input, output: state.output }
+      : state.status === "running"
+        ? {
+            status: "running",
+            input: state.input ?? {},
+            title: state.title,
+            time: { start: 1 },
+          }
+        : {
+            status: "pending",
+            input: state.input ?? {},
+            raw: state.raw ?? "",
+          };
+
   return {
-    info: { id, role: "assistant", sessionID: "sess-1" },
+    info: {
+      id,
+      role: "assistant",
+      sessionID: "sess-1",
+      time:
+        state.status === "completed"
+          ? { created: 1, completed: 2 }
+          : { created: 1 },
+    },
     parts: [
       {
         type: "tool",
         tool: toolName,
-        state: { status: "completed", input, output },
+        state: toolState,
       },
     ],
   };
@@ -616,7 +657,13 @@ describe("estimateTotalChars", () => {
   });
 
   test("counts completed tool input + output", () => {
-    const messages = [makeToolMsg("1", "read", { path: "/a" }, "contents")];
+    const messages = [
+      makeToolMsg("1", "read", {
+        status: "completed",
+        input: { path: "/a" },
+        output: "contents",
+      }),
+    ];
     // JSON.stringify({path:"/a"}) = '{"path":"/a"}' = 13 chars
     // "contents" = 8 chars
     expect(estimateTotalChars(messages)).toBe(13 + 8);
@@ -884,6 +931,7 @@ describe("compaction integration", () => {
   test("plugin hook reuses exact transcript and incrementally extends older prefixes", async () => {
     const originalFetch = globalThis.fetch;
     const requests: Array<{ url: string; body: any }> = [];
+    const toasts: Array<{ title?: string; message: string; variant: string }> = [];
 
     globalThis.fetch = async (input, init) => {
       const url = input instanceof Request ? input.url : String(input);
@@ -923,6 +971,11 @@ describe("compaction integration", () => {
               logs.push(body);
             },
           },
+          tui: {
+            showToast: async ({ body }: any) => {
+              toasts.push(body);
+            },
+          },
         },
       });
 
@@ -946,6 +999,9 @@ describe("compaction integration", () => {
       const secondOutput = { messages: structuredClone(baseMessages) };
       await transform({}, secondOutput);
       expect(requests).toHaveLength(1);
+      expect(toasts).toHaveLength(1);
+      expect(toasts[0]!.variant).toBe("success");
+      expect(toasts[0]!.message).toContain("Context compacted in");
 
       const extendedMessages = [
         ...baseMessages,
@@ -965,6 +1021,191 @@ describe("compaction integration", () => {
       expect(
         logs.some((entry) => entry.message.includes("Compact (incremental)")),
       ).toBe(true);
+      expect(toasts).toHaveLength(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+
+      if (originalEnv.MORPH_API_KEY === undefined) {
+        delete process.env.MORPH_API_KEY;
+      } else {
+        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
+      }
+
+      if (originalEnv.MORPH_COMPACT === undefined) {
+        delete process.env.MORPH_COMPACT;
+      } else {
+        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
+      }
+
+      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
+        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
+      } else {
+        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
+          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
+      }
+
+      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
+        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
+      } else {
+        process.env.MORPH_COMPACT_PRESERVE_RECENT =
+          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
+      }
+    }
+  });
+
+  test("plugin hook defers compaction while the recent tail has an in-flight tool call", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: any }> = [];
+    const toasts: Array<{ title?: string; message: string; variant: string }> =
+      [];
+
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      requests.push({ url, body });
+
+      return new Response(JSON.stringify(makeCompactResult("summary-1")), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const originalEnv = {
+      MORPH_API_KEY: process.env.MORPH_API_KEY,
+      MORPH_COMPACT: process.env.MORPH_COMPACT,
+      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
+      MORPH_COMPACT_PRESERVE_RECENT:
+        process.env.MORPH_COMPACT_PRESERVE_RECENT,
+    };
+
+    process.env.MORPH_API_KEY = "sk-test-key";
+    process.env.MORPH_COMPACT = "true";
+    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
+    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
+
+    try {
+      const mod = await import(
+        `./index.ts?compaction-pending-tool-test=${Date.now()}-${Math.random()}`
+      );
+      const plugin = mod.default;
+      const hooks = await plugin({
+        directory: import.meta.dir,
+        client: {
+          app: { log: async () => {} },
+          tui: {
+            showToast: async ({ body }: any) => {
+              toasts.push(body);
+            },
+          },
+        },
+      });
+
+      const transform = hooks["experimental.chat.messages.transform"];
+      await transform(
+        {},
+        {
+          messages: structuredClone([
+            makeTextMsg("1", "user", "A".repeat(100)),
+            makeTextMsg("2", "assistant", "B".repeat(100)),
+            makeToolMsg("3", "read", {
+              status: "running",
+              input: { path: "/tmp/file.ts" },
+              title: "Reading file",
+            }),
+          ]),
+        },
+      );
+
+      expect(requests).toHaveLength(0);
+      expect(toasts).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+
+      if (originalEnv.MORPH_API_KEY === undefined) {
+        delete process.env.MORPH_API_KEY;
+      } else {
+        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
+      }
+
+      if (originalEnv.MORPH_COMPACT === undefined) {
+        delete process.env.MORPH_COMPACT;
+      } else {
+        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
+      }
+
+      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
+        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
+      } else {
+        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
+          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
+      }
+
+      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
+        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
+      } else {
+        process.env.MORPH_COMPACT_PRESERVE_RECENT =
+          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
+      }
+    }
+  });
+
+  test("plugin hook defers compaction when the compaction boundary ends on an in-flight tool call", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: any }> = [];
+
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      requests.push({ url, body });
+
+      return new Response(JSON.stringify(makeCompactResult("summary-1")), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const originalEnv = {
+      MORPH_API_KEY: process.env.MORPH_API_KEY,
+      MORPH_COMPACT: process.env.MORPH_COMPACT,
+      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
+      MORPH_COMPACT_PRESERVE_RECENT:
+        process.env.MORPH_COMPACT_PRESERVE_RECENT,
+    };
+
+    process.env.MORPH_API_KEY = "sk-test-key";
+    process.env.MORPH_COMPACT = "true";
+    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
+    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
+
+    try {
+      const mod = await import(
+        `./index.ts?compaction-boundary-tool-test=${Date.now()}-${Math.random()}`
+      );
+      const plugin = mod.default;
+      const hooks = await plugin({
+        directory: import.meta.dir,
+        client: {
+          app: { log: async () => {} },
+        },
+      });
+
+      const transform = hooks["experimental.chat.messages.transform"];
+      await transform(
+        {},
+        {
+          messages: structuredClone([
+            makeTextMsg("1", "user", "A".repeat(100)),
+            makeToolMsg("2", "read", {
+              status: "pending",
+              input: { path: "/tmp/file.ts" },
+              raw: "{\"path\":\"/tmp/file.ts\"}",
+            }),
+            makeTextMsg("3", "user", "C".repeat(100)),
+          ]),
+        },
+      );
+
+      expect(requests).toHaveLength(0);
     } finally {
       globalThis.fetch = originalFetch;
 
