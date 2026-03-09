@@ -11,6 +11,14 @@ import { type Plugin, tool } from "@opencode-ai/plugin";
 import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
+import {
+  type CompactInputMessage,
+  buildCompactCacheEntry,
+  buildIncrementalCompactInput,
+  canExtendCompactCache,
+  canReuseCompactCache,
+  createBoundedCompactCache,
+} from "./compact-cache";
 
 // Config from environment — only MORPH_API_KEY is required
 const MORPH_API_KEY = process.env.MORPH_API_KEY;
@@ -88,14 +96,17 @@ const compactClient = new CompactClient({
 });
 
 /**
- * Cache for compaction results.
- * Keyed by a hash of the message IDs that were compacted,
- * so we don't re-compact the same messages on every LLM call.
+ * Cache compaction state per session so we can reuse identical prefixes and
+ * incrementally extend previously compacted prefixes instead of recompacting
+ * the full older window on every boundary shift.
+ *
+ * Bounded LRU cache capped at MAX_COMPACT_CACHE_SESSIONS entries.
+ * Both reads and writes refresh recency; the least-recently-used session
+ * is evicted first (Map preserves insertion order).
  */
-let compactCache: {
-  messageIdHash: string;
-  result: CompactResult;
-} | null = null;
+const MAX_COMPACT_CACHE_SESSIONS = 50;
+const compactCacheBySession =
+  createBoundedCompactCache<CompactResult>(MAX_COMPACT_CACHE_SESSIONS);
 
 /**
  * Normalize code_edit input from LLM tool calls.
@@ -183,13 +194,6 @@ function estimateTotalChars(
     }
   }
   return total;
-}
-
-/**
- * Simple hash of message IDs for cache keying.
- */
-function hashMessageIds(messages: { info: Message }[]): string {
-  return messages[messages.length - 1]!.info.id;
 }
 
 /**
@@ -1052,21 +1056,46 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       if (olderMessages.length === 0) return;
 
-      // Check cache — reuse until a new message crosses into the older window
-      const currentHash = hashMessageIds(olderMessages);
-      if (compactCache && compactCache.messageIdHash === currentHash) {
-        // Rebuild output from cached compaction
+      const sessionID = olderMessages[0]!.info.sessionID;
+      const sessionCache = compactCacheBySession.get(sessionID);
+      if (sessionCache && canReuseCompactCache(sessionCache, olderMessages)) {
         const compactedMsg = buildCompactedMessage(
           olderMessages[0]!,
-          compactCache.result,
+          sessionCache.result,
           olderMessages.length,
         );
         output.messages = [compactedMsg, ...recentMessages];
         return;
       }
 
-      // Convert to compact API format and call Morph
-      const compactInput = messagesToCompactInput(olderMessages);
+      let compactInput = messagesToCompactInput(olderMessages);
+      let compactionMode: "full" | "incremental" = "full";
+
+      if (sessionCache && canExtendCompactCache(sessionCache, olderMessages)) {
+        compactInput = buildIncrementalCompactInput(
+          sessionCache,
+          olderMessages,
+          messagesToCompactInput,
+        );
+        compactionMode = "incremental";
+
+        // New messages crossed into the older window but had no compactable content.
+        // Reuse the prior summary and just advance the cache boundary metadata.
+        if (compactInput.length === 1) {
+          compactCacheBySession.set(
+            sessionID,
+            buildCompactCacheEntry(olderMessages, sessionCache.result),
+          );
+          const compactedMsg = buildCompactedMessage(
+            olderMessages[0]!,
+            sessionCache.result,
+            olderMessages.length,
+          );
+          output.messages = [compactedMsg, ...recentMessages];
+          return;
+        }
+      }
+
       if (compactInput.length === 0) return;
 
       try {
@@ -1076,8 +1105,10 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           preserveRecent: 0, // we handle preservation ourselves
         });
 
-        // Cache the result
-        compactCache = { messageIdHash: currentHash, result };
+        compactCacheBySession.set(
+          sessionID,
+          buildCompactCacheEntry(olderMessages, result),
+        );
 
         const compactedMsg = buildCompactedMessage(
           olderMessages[0]!,
@@ -1088,7 +1119,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
         await log(
           "info",
-          `Compact: ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+          `Compact (${compactionMode}): ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
         );
       } catch (err) {
         // On failure, leave messages unchanged — OpenCode's built-in compaction

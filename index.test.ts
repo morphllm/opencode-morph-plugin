@@ -2,6 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CompactClient } from "@morphllm/morphsdk";
+import {
+  buildCompactCacheEntry,
+  buildIncrementalCompactInput,
+  canExtendCompactCache,
+  canReuseCompactCache,
+  createBoundedCompactCache,
+} from "./compact-cache";
 
 // These are internal to the plugin but duplicated here for testing.
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -402,9 +409,44 @@ function estimateTotalChars(messages: FakeMessage[]): number {
   return total;
 }
 
-function hashMessageIds(messages: { info: { id: string } }[]): string {
-  return messages.map((m) => m.info.id).join("|");
+type FakeCompactResult = {
+  id: string;
+  output: string;
+  messages: Array<{
+    role: string;
+    content: string;
+    compacted_line_ranges: Array<{ start: number; end: number }>;
+  }>;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    compression_ratio: number;
+    processing_time_ms: number;
+  };
+  model: string;
+};
+
+function makeCompactResult(output: string): FakeCompactResult {
+  return {
+    id: `compact-${output}`,
+    output,
+    messages: [
+      {
+        role: "user",
+        content: output,
+        compacted_line_ranges: [],
+      },
+    ],
+    usage: {
+      input_tokens: 100,
+      output_tokens: 25,
+      compression_ratio: 0.25,
+      processing_time_ms: 5,
+    },
+    model: "morph-compactor",
+  };
 }
+
 
 // Helpers to build fake messages for tests
 function makeTextMsg(
@@ -611,29 +653,123 @@ describe("estimateTotalChars", () => {
   });
 });
 
-describe("hashMessageIds", () => {
-  test("joins message IDs with pipe", () => {
-    const messages = [
-      { info: { id: "abc" } },
-      { info: { id: "def" } },
-      { info: { id: "ghi" } },
+describe("incremental compaction cache helpers", () => {
+  test("reuses cache only for the exact same older prefix", () => {
+    const older = [
+      makeTextMsg("1", "user", "hello"),
+      makeTextMsg("2", "assistant", "hi"),
     ];
-    expect(hashMessageIds(messages)).toBe("abc|def|ghi");
+    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
+
+    expect(canReuseCompactCache(cache, older)).toBe(true);
+    expect(
+      canReuseCompactCache(cache, [...older, makeTextMsg("3", "user", "next")]),
+    ).toBe(false);
   });
 
-  test("returns empty string for empty array", () => {
-    expect(hashMessageIds([])).toBe("");
+  test("extends cache when the older prefix grows by appending messages", () => {
+    const older = [
+      makeTextMsg("1", "user", "hello"),
+      makeTextMsg("2", "assistant", "hi"),
+    ];
+    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
+    const extended = [...older, makeTextMsg("3", "user", "next step")];
+
+    expect(canExtendCompactCache(cache, extended)).toBe(true);
+    expect(
+      buildIncrementalCompactInput(cache, extended, messagesToCompactInput),
+    ).toEqual([
+      {
+        role: "user",
+        content: "[Morph Compact summary of 2 earlier messages]\n\nsummary",
+      },
+      { role: "user", content: "next step" },
+    ]);
   });
 
-  test("handles single message", () => {
-    expect(hashMessageIds([{ info: { id: "only" } }])).toBe("only");
+  test("falls back to full compaction when the cached prefix no longer matches", () => {
+    const older = [
+      makeTextMsg("1", "user", "hello"),
+      makeTextMsg("2", "assistant", "hi"),
+    ];
+    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
+    const differentPrefix = [
+      makeTextMsg("x", "user", "different"),
+      makeTextMsg("2", "assistant", "hi"),
+      makeTextMsg("3", "user", "next"),
+    ];
+
+    expect(canExtendCompactCache(cache, differentPrefix)).toBe(false);
+  });
+});
+
+describe("bounded LRU compact cache", () => {
+  function entryForSession(sid: string) {
+    const msgs = [makeTextMsg("1", "user", "hi")];
+    msgs[0]!.info.sessionID = sid;
+    return buildCompactCacheEntry(msgs, makeCompactResult(`summary-${sid}`));
+  }
+
+  test("evicts least-recently-used entry when cap is exceeded", () => {
+    const cache = createBoundedCompactCache<FakeCompactResult>(3);
+    cache.set("s1", entryForSession("s1"));
+    cache.set("s2", entryForSession("s2"));
+    cache.set("s3", entryForSession("s3"));
+
+    // All three present
+    expect(cache.size()).toBe(3);
+
+    // Adding a 4th evicts s1 (oldest)
+    cache.set("s4", entryForSession("s4"));
+    expect(cache.size()).toBe(3);
+    expect(cache.get("s1")).toBeUndefined();
+    expect(cache.get("s4")).toBeDefined();
+  });
+
+  test("read refreshes recency so hot sessions survive eviction", () => {
+    const cache = createBoundedCompactCache<FakeCompactResult>(3);
+    cache.set("s1", entryForSession("s1"));
+    cache.set("s2", entryForSession("s2"));
+    cache.set("s3", entryForSession("s3"));
+
+    // Read s1 — moves it to the most-recent position
+    cache.get("s1");
+
+    // Now s2 is the oldest. Adding s4 should evict s2, not s1.
+    cache.set("s4", entryForSession("s4"));
+    expect(cache.get("s1")).toBeDefined();
+    expect(cache.get("s2")).toBeUndefined();
+    expect(cache.get("s3")).toBeDefined();
+    expect(cache.get("s4")).toBeDefined();
+  });
+
+  test("write refreshes recency for existing sessions", () => {
+    const cache = createBoundedCompactCache<FakeCompactResult>(3);
+    cache.set("s1", entryForSession("s1"));
+    cache.set("s2", entryForSession("s2"));
+    cache.set("s3", entryForSession("s3"));
+
+    // Re-write s1 — moves it to the most-recent position
+    cache.set("s1", entryForSession("s1"));
+
+    // s2 is now oldest
+    cache.set("s4", entryForSession("s4"));
+    expect(cache.get("s1")).toBeDefined();
+    expect(cache.get("s2")).toBeUndefined();
   });
 });
 
 describe("compaction integration", () => {
   const MORPH_API_KEY = process.env.MORPH_API_KEY;
+  const RUN_LIVE_COMPACT_TESTS =
+    process.env.MORPH_RUN_LIVE_COMPACT_TESTS === "true";
 
   test("CompactClient.compact() returns valid result", async () => {
+    if (!RUN_LIVE_COMPACT_TESTS) {
+      console.log("Skipping: MORPH_RUN_LIVE_COMPACT_TESTS not enabled");
+      return;
+    }
+
     if (!MORPH_API_KEY) {
       console.log("Skipping: MORPH_API_KEY not set");
       return;
@@ -720,17 +856,15 @@ describe("compaction integration", () => {
     expect(compactInput.length).toBe(14);
     expect(compactInput.every((m) => m.content.length > 0)).toBe(true);
 
-    // Hash is stable
-    const hash1 = hashMessageIds(older);
-    const hash2 = hashMessageIds(older);
-    expect(hash1).toBe(hash2);
-
-    // Hash changes when messages change
-    const differentOlder = [
-      ...older.slice(0, -1),
-      makeTextMsg("new-id", "user", "different"),
-    ];
-    expect(hashMessageIds(differentOlder)).not.toBe(hash1);
+    // Incremental cache reuses exact prefixes and can extend appended ones
+    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
+    expect(canReuseCompactCache(cache, older)).toBe(true);
+    expect(
+      canExtendCompactCache(
+        cache,
+        [...older, makeTextMsg("new-id", "user", "different")],
+      ),
+    ).toBe(true);
   });
 
   test("too few messages does not trigger compaction", () => {
@@ -745,6 +879,234 @@ describe("compaction integration", () => {
     );
     // Even though chars are high, message count is below threshold
     expect(messages.length).toBeLessThan(PRESERVE_RECENT + 2);
+  });
+
+  test("plugin hook reuses exact transcript and incrementally extends older prefixes", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: any }> = [];
+
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      requests.push({ url, body });
+
+      return new Response(JSON.stringify(makeCompactResult(`summary-${requests.length}`)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const originalEnv = {
+      MORPH_API_KEY: process.env.MORPH_API_KEY,
+      MORPH_COMPACT: process.env.MORPH_COMPACT,
+      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
+      MORPH_COMPACT_PRESERVE_RECENT:
+        process.env.MORPH_COMPACT_PRESERVE_RECENT,
+    };
+
+    process.env.MORPH_API_KEY = "sk-test-key";
+    process.env.MORPH_COMPACT = "true";
+    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
+    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
+
+    try {
+      const mod = await import(
+        `./index.ts?compaction-hook-test=${Date.now()}-${Math.random()}`
+      );
+      const plugin = mod.default;
+      const logs: any[] = [];
+      const hooks = await plugin({
+        directory: import.meta.dir,
+        client: {
+          app: {
+            log: async ({ body }: any) => {
+              logs.push(body);
+            },
+          },
+        },
+      });
+
+      const transform = hooks["experimental.chat.messages.transform"];
+      expect(typeof transform).toBe("function");
+
+      const baseMessages = [
+        makeTextMsg("1", "user", "A".repeat(100)),
+        makeTextMsg("2", "assistant", "B".repeat(100)),
+        makeTextMsg("3", "user", "C".repeat(100)),
+      ];
+
+      const firstOutput = { messages: structuredClone(baseMessages) };
+      await transform({}, firstOutput);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.body.messages).toEqual([
+        { role: "user", content: "A".repeat(100) },
+        { role: "assistant", content: "B".repeat(100) },
+      ]);
+
+      const secondOutput = { messages: structuredClone(baseMessages) };
+      await transform({}, secondOutput);
+      expect(requests).toHaveLength(1);
+
+      const extendedMessages = [
+        ...baseMessages,
+        makeTextMsg("4", "assistant", "D".repeat(100)),
+      ];
+      const thirdOutput = { messages: structuredClone(extendedMessages) };
+      await transform({}, thirdOutput);
+
+      expect(requests).toHaveLength(2);
+      expect(requests[1]!.body.messages).toEqual([
+        {
+          role: "user",
+          content: "[Morph Compact summary of 2 earlier messages]\n\nsummary-1",
+        },
+        { role: "user", content: "C".repeat(100) },
+      ]);
+      expect(
+        logs.some((entry) => entry.message.includes("Compact (incremental)")),
+      ).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+
+      if (originalEnv.MORPH_API_KEY === undefined) {
+        delete process.env.MORPH_API_KEY;
+      } else {
+        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
+      }
+
+      if (originalEnv.MORPH_COMPACT === undefined) {
+        delete process.env.MORPH_COMPACT;
+      } else {
+        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
+      }
+
+      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
+        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
+      } else {
+        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
+          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
+      }
+
+      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
+        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
+      } else {
+        process.env.MORPH_COMPACT_PRESERVE_RECENT =
+          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
+      }
+    }
+  });
+
+  test("plugin hook keeps compaction cache isolated per session", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: any }> = [];
+
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      requests.push({ url, body });
+
+      return new Response(JSON.stringify(makeCompactResult(`summary-${requests.length}`)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const originalEnv = {
+      MORPH_API_KEY: process.env.MORPH_API_KEY,
+      MORPH_COMPACT: process.env.MORPH_COMPACT,
+      MORPH_COMPACT_CHAR_THRESHOLD: process.env.MORPH_COMPACT_CHAR_THRESHOLD,
+      MORPH_COMPACT_PRESERVE_RECENT:
+        process.env.MORPH_COMPACT_PRESERVE_RECENT,
+    };
+
+    process.env.MORPH_API_KEY = "sk-test-key";
+    process.env.MORPH_COMPACT = "true";
+    process.env.MORPH_COMPACT_CHAR_THRESHOLD = "1";
+    process.env.MORPH_COMPACT_PRESERVE_RECENT = "1";
+
+    try {
+      const mod = await import(
+        `./index.ts?compaction-session-test=${Date.now()}-${Math.random()}`
+      );
+      const plugin = mod.default;
+      const hooks = await plugin({
+        directory: import.meta.dir,
+        client: {
+          app: { log: async () => {} },
+        },
+      });
+
+      const transform = hooks["experimental.chat.messages.transform"];
+      const sessionOne = [
+        {
+          ...makeTextMsg("1", "user", "A".repeat(100)),
+          info: { id: "1", role: "user" as const, sessionID: "s1" },
+        },
+        {
+          ...makeTextMsg("2", "assistant", "B".repeat(100)),
+          info: { id: "2", role: "assistant" as const, sessionID: "s1" },
+        },
+        {
+          ...makeTextMsg("3", "user", "C".repeat(100)),
+          info: { id: "3", role: "user" as const, sessionID: "s1" },
+        },
+      ];
+      const sessionTwo = [
+        {
+          ...makeTextMsg("1", "user", "A".repeat(100)),
+          info: { id: "1", role: "user" as const, sessionID: "s2" },
+        },
+        {
+          ...makeTextMsg("2", "assistant", "B".repeat(100)),
+          info: { id: "2", role: "assistant" as const, sessionID: "s2" },
+        },
+        {
+          ...makeTextMsg("3", "user", "C".repeat(100)),
+          info: { id: "3", role: "user" as const, sessionID: "s2" },
+        },
+      ];
+
+      await transform({}, { messages: structuredClone(sessionOne) });
+      await transform({}, { messages: structuredClone(sessionTwo) });
+
+      expect(requests).toHaveLength(2);
+      expect(requests[0]!.body.messages).toEqual([
+        { role: "user", content: "A".repeat(100) },
+        { role: "assistant", content: "B".repeat(100) },
+      ]);
+      expect(requests[1]!.body.messages).toEqual([
+        { role: "user", content: "A".repeat(100) },
+        { role: "assistant", content: "B".repeat(100) },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+
+      if (originalEnv.MORPH_API_KEY === undefined) {
+        delete process.env.MORPH_API_KEY;
+      } else {
+        process.env.MORPH_API_KEY = originalEnv.MORPH_API_KEY;
+      }
+
+      if (originalEnv.MORPH_COMPACT === undefined) {
+        delete process.env.MORPH_COMPACT;
+      } else {
+        process.env.MORPH_COMPACT = originalEnv.MORPH_COMPACT;
+      }
+
+      if (originalEnv.MORPH_COMPACT_CHAR_THRESHOLD === undefined) {
+        delete process.env.MORPH_COMPACT_CHAR_THRESHOLD;
+      } else {
+        process.env.MORPH_COMPACT_CHAR_THRESHOLD =
+          originalEnv.MORPH_COMPACT_CHAR_THRESHOLD;
+      }
+
+      if (originalEnv.MORPH_COMPACT_PRESERVE_RECENT === undefined) {
+        delete process.env.MORPH_COMPACT_PRESERVE_RECENT;
+      } else {
+        process.env.MORPH_COMPACT_PRESERVE_RECENT =
+          originalEnv.MORPH_COMPACT_PRESERVE_RECENT;
+      }
+    }
   });
 });
 
