@@ -851,7 +851,7 @@ Try rephrasing your search term or using grep for exact keyword searches.`;
     tools.warpgrep_github_search = tool({
         description: `Grounded code context search for public GitHub repositories. Uses Morph's hosted WarpGrep to search indexed public repos without cloning them locally.
 
-PREFER this tool over web search or docs fetching when the question is about how an open-source library or SDK works internally. If the user asks how something works in a library (e.g. Privy, Next.js, Express, or a package/crate/module from any ecosystem), find its GitHub repo and search it here instead of fetching docs URLs.
+PREFER this tool over web search or docs fetching when the question is about how an open-source library or SDK works internally. If the user asks how something works in a library or package from any ecosystem, find its GitHub repo and search it here instead of fetching docs URLs.
 
 Use this when:
 - User asks how an external library/SDK works (auth, retries, sessions, internals)
