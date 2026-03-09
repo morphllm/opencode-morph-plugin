@@ -54,7 +54,7 @@ Use `warpgrep_github_search` when:
 - User asks how an external library/SDK works (auth, retries, sessions, internals)
 - You need implementation details of any open-source dependency
 - Docs URLs are failing — search the source instead
-- The user didn't provide a repo — infer the canonical GitHub owner/repo from the package name
+- The user didn't provide a repo — infer the canonical GitHub owner/repo from the package, crate, or module name using the matching ecosystem registry first
 
 Examples:
 - "How does Privy handle session token refresh?" → find `privy-io/privy-browser`, search it

@@ -303,7 +303,7 @@ function formatPublicRepoResolutionFailure(
     const list = suggestions.map((s) => `- ${s.fullName}${s.description ? ` - ${s.description}` : ""}`).join("\n");
     parts.push(`Public repos found under this org:\n${list}\n\nIf one of these looks right, retry with that owner_repo.`);
   }
-  parts.push(`If the SDK is closed-source or private:\n- Check the npm package page (https://www.npmjs.com/package/<package-name>) for a repository link\n- The real source repo may be under a different org or name\n- Stop trying variations and report that the source is not publicly available`);
+  parts.push(`If the package or SDK is closed-source or private:\n- Check the ecosystem registry or package page for repository metadata before guessing more names\n- Use the registry that matches the environment: npm for Node/TypeScript, crates.io for Rust, PyPI for Python, pkg.go.dev for Go, etc.\n- The real source repo may be under a different org or name\n- Stop trying variations and report that the source is not publicly available`);
   return parts.join("\n\n");
 }
 
@@ -851,13 +851,13 @@ Try rephrasing your search term or using grep for exact keyword searches.`;
     tools.warpgrep_github_search = tool({
         description: `Grounded code context search for public GitHub repositories. Uses Morph's hosted WarpGrep to search indexed public repos without cloning them locally.
 
-PREFER this tool over web search or docs fetching when the question is about how an open-source library or SDK works internally. If the user asks how something works in a library (e.g. Privy, Next.js, Express, any npm/PyPI package), find its GitHub repo and search it here instead of fetching docs URLs.
+PREFER this tool over web search or docs fetching when the question is about how an open-source library or SDK works internally. If the user asks how something works in a library (e.g. Privy, Next.js, Express, or a package/crate/module from any ecosystem), find its GitHub repo and search it here instead of fetching docs URLs.
 
 Use this when:
 - User asks how an external library/SDK works (auth, retries, sessions, internals)
 - You need to understand implementation details of any open-source dependency
 - Docs URLs are failing or returning 404s — search the source instead
-- User asks about a framework or tool they didn't provide a repo for — infer the canonical GitHub repo
+- User asks about a framework or tool they didn't provide a repo for — infer the canonical GitHub repo from the matching ecosystem (npm, crates.io, PyPI, pkg.go.dev, etc.) before guessing owner/repo variants
 
 This tool is for public remote repos. For the current checked-out workspace, use warpgrep_codebase_search instead.
 
