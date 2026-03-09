@@ -12,7 +12,6 @@ import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import {
-  type CompactInputMessage,
   buildCompactCacheEntry,
   buildIncrementalCompactInput,
   canExtendCompactCache,
