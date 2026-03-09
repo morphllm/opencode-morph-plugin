@@ -19,10 +19,18 @@ type ResultWithOutput = {
 
 export type SessionCompactCache<TResult = CompactResult> = {
   sessionID: string;
-  firstMessageId: string;
-  lastMessageId: string;
   messageCount: number;
+  messageDigests: string[];
+  prefixDigest: string;
+  configDigest: string;
   result: TResult;
+  incrementalCount: number;
+};
+
+export type CompactFingerprint = {
+  messageDigests: string[];
+  prefixDigest: string;
+  configDigest: string;
 };
 
 export function createBoundedCompactCache<TResult>(maxSize: number) {
@@ -63,51 +71,65 @@ export function buildCompactCacheEntry<
 >(
   messages: TMessage[],
   result: TResult,
+  fingerprint: CompactFingerprint,
+  incrementalCount: number = 0,
 ): SessionCompactCache<TResult> {
   return {
     sessionID: messages[0]!.info.sessionID,
-    firstMessageId: messages[0]!.info.id,
-    lastMessageId: messages[messages.length - 1]!.info.id,
     messageCount: messages.length,
+    messageDigests: fingerprint.messageDigests,
+    prefixDigest: fingerprint.prefixDigest,
+    configDigest: fingerprint.configDigest,
     result,
+    incrementalCount,
   };
 }
 
-export function canReuseCompactCache<TMessage extends CacheableMessage, TResult>(
+export function canReuseCompactCache<TResult>(
   cache: SessionCompactCache<TResult>,
-  messages: TMessage[],
+  sessionID: string,
+  fingerprint: CompactFingerprint,
 ): boolean {
   return (
-    cache.sessionID === messages[0]!.info.sessionID &&
-    cache.messageCount === messages.length &&
-    cache.firstMessageId === messages[0]!.info.id &&
-    cache.lastMessageId === messages[messages.length - 1]!.info.id
+    cache.sessionID === sessionID &&
+    cache.messageCount === fingerprint.messageDigests.length &&
+    cache.configDigest === fingerprint.configDigest &&
+    cache.prefixDigest === fingerprint.prefixDigest
   );
 }
 
-export function canExtendCompactCache<
-  TMessage extends CacheableMessage,
-  TResult,
->(
+export function canExtendCompactCache<TResult>(
   cache: SessionCompactCache<TResult>,
-  messages: TMessage[],
+  sessionID: string,
+  fingerprint: CompactFingerprint,
+  maxIncrementalExtensions: number = 10,
 ): boolean {
   if (
-    cache.sessionID !== messages[0]!.info.sessionID ||
-    cache.messageCount >= messages.length ||
-    cache.firstMessageId !== messages[0]!.info.id
+    cache.sessionID !== sessionID ||
+    cache.configDigest !== fingerprint.configDigest ||
+    cache.messageCount >= fingerprint.messageDigests.length
   ) {
     return false;
   }
 
-  return messages[cache.messageCount - 1]?.info.id === cache.lastMessageId;
+  if (cache.incrementalCount >= maxIncrementalExtensions) {
+    return false;
+  }
+
+  if (cache.messageDigests.length !== cache.messageCount) {
+    return false;
+  }
+
+  return cache.messageDigests.every(
+    (digest, index) => fingerprint.messageDigests[index] === digest,
+  );
 }
 
 export function buildCachedCompactInput<TResult extends ResultWithOutput>(
   cache: SessionCompactCache<TResult>,
 ): CompactInputMessage {
   return {
-    role: "user",
+    role: "assistant",
     content: `[Morph Compact summary of ${cache.messageCount} earlier messages]\n\n${cache.result.output}`,
   };
 }

@@ -381,7 +381,7 @@ function serializePart(part: FakePart): string {
       return `[Tool: ${part.tool}] ${state.status}`;
     }
     case "reasoning":
-      return `[Reasoning] ${part.text}`;
+      return "";
     default:
       return `[${part.type}]`;
   }
@@ -393,9 +393,28 @@ function messagesToCompactInput(
   return messages
     .map((m) => ({
       role: m.info.role,
-      content: m.parts.map(serializePart).join("\n"),
+      content: m.parts.map(serializePart).filter(Boolean).join("\n"),
     }))
     .filter((m) => m.content.length > 0);
+}
+
+function buildFakeFingerprint(
+  messages: FakeMessage[],
+  configDigest = "cfg-v1",
+) {
+  const messageDigests = messages.map((message) =>
+    JSON.stringify({
+      id: message.info.id,
+      role: message.info.role,
+      content: message.parts.map(serializePart).filter(Boolean),
+    }),
+  );
+
+  return {
+    messageDigests,
+    prefixDigest: messageDigests.join("\x1e"),
+    configDigest,
+  };
 }
 
 function estimateTotalChars(messages: FakeMessage[]): number {
@@ -588,10 +607,10 @@ describe("serializePart", () => {
     expect(result).toBe("[Tool: edit] pending");
   });
 
-  test("serializes reasoning part", () => {
+  test("omits reasoning part from compaction input", () => {
     expect(
       serializePart({ type: "reasoning", text: "thinking about this..." }),
-    ).toBe("[Reasoning] thinking about this...");
+    ).toBe("");
   });
 
   test("serializes unknown part type as bracket marker", () => {
@@ -674,6 +693,14 @@ describe("messagesToCompactInput", () => {
     expect(result[0]!.content).toContain("[Tool: read]");
     expect(result[0]!.content).toContain("Done");
   });
+
+  test("omits reasoning-only content entirely", () => {
+    const msg: FakeMessage = {
+      info: { id: "1", role: "assistant", sessionID: "s" },
+      parts: [{ type: "reasoning", text: "private chain of thought" }],
+    };
+    expect(messagesToCompactInput([msg])).toEqual([]);
+  });
 });
 
 describe("estimateTotalChars", () => {
@@ -735,11 +762,21 @@ describe("incremental compaction cache helpers", () => {
       makeTextMsg("1", "user", "hello"),
       makeTextMsg("2", "assistant", "hi"),
     ];
-    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
+    const sessionID = older[0]!.info.sessionID;
+    const fingerprint = buildFakeFingerprint(older);
+    const cache = buildCompactCacheEntry(
+      older,
+      makeCompactResult("summary"),
+      fingerprint,
+    );
 
-    expect(canReuseCompactCache(cache, older)).toBe(true);
+    expect(canReuseCompactCache(cache, sessionID, fingerprint)).toBe(true);
     expect(
-      canReuseCompactCache(cache, [...older, makeTextMsg("3", "user", "next")]),
+      canReuseCompactCache(
+        cache,
+        sessionID,
+        buildFakeFingerprint([...older, makeTextMsg("3", "user", "next")]),
+      ),
     ).toBe(false);
   });
 
@@ -748,15 +785,22 @@ describe("incremental compaction cache helpers", () => {
       makeTextMsg("1", "user", "hello"),
       makeTextMsg("2", "assistant", "hi"),
     ];
-    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
+    const sessionID = older[0]!.info.sessionID;
+    const cache = buildCompactCacheEntry(
+      older,
+      makeCompactResult("summary"),
+      buildFakeFingerprint(older),
+    );
     const extended = [...older, makeTextMsg("3", "user", "next step")];
 
-    expect(canExtendCompactCache(cache, extended)).toBe(true);
+    expect(
+      canExtendCompactCache(cache, sessionID, buildFakeFingerprint(extended)),
+    ).toBe(true);
     expect(
       buildIncrementalCompactInput(cache, extended, messagesToCompactInput),
     ).toEqual([
       {
-        role: "user",
+        role: "assistant",
         content: "[Morph Compact summary of 2 earlier messages]\n\nsummary",
       },
       { role: "user", content: "next step" },
@@ -768,14 +812,76 @@ describe("incremental compaction cache helpers", () => {
       makeTextMsg("1", "user", "hello"),
       makeTextMsg("2", "assistant", "hi"),
     ];
-    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
+    const sessionID = older[0]!.info.sessionID;
+    const cache = buildCompactCacheEntry(
+      older,
+      makeCompactResult("summary"),
+      buildFakeFingerprint(older),
+    );
     const differentPrefix = [
       makeTextMsg("x", "user", "different"),
       makeTextMsg("2", "assistant", "hi"),
       makeTextMsg("3", "user", "next"),
     ];
 
-    expect(canExtendCompactCache(cache, differentPrefix)).toBe(false);
+    expect(
+      canExtendCompactCache(
+        cache,
+        sessionID,
+        buildFakeFingerprint(differentPrefix),
+      ),
+    ).toBe(false);
+  });
+
+  test("does not reuse cache when middle message content changes but ids stay stable", () => {
+    const older = [
+      makeTextMsg("1", "user", "hello"),
+      makeTextMsg("2", "assistant", "hi"),
+      makeTextMsg("3", "user", "next"),
+    ];
+    const sessionID = older[0]!.info.sessionID;
+    const cache = buildCompactCacheEntry(
+      older,
+      makeCompactResult("summary"),
+      buildFakeFingerprint(older),
+    );
+    const editedMiddle = [
+      older[0]!,
+      {
+        ...older[1]!,
+        parts: [{ type: "text", text: "changed answer" }] as FakePart[],
+      },
+      older[2]!,
+    ];
+
+    expect(
+      canReuseCompactCache(
+        cache,
+        sessionID,
+        buildFakeFingerprint(editedMiddle),
+      ),
+    ).toBe(false);
+  });
+
+  test("does not reuse cache when compaction config changes", () => {
+    const older = [
+      makeTextMsg("1", "user", "hello"),
+      makeTextMsg("2", "assistant", "hi"),
+    ];
+    const sessionID = older[0]!.info.sessionID;
+    const cache = buildCompactCacheEntry(
+      older,
+      makeCompactResult("summary"),
+      buildFakeFingerprint(older, "cfg-v1"),
+    );
+
+    expect(
+      canReuseCompactCache(
+        cache,
+        sessionID,
+        buildFakeFingerprint(older, "cfg-v2"),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -783,7 +889,11 @@ describe("bounded LRU compact cache", () => {
   function entryForSession(sid: string) {
     const msgs = [makeTextMsg("1", "user", "hi")];
     msgs[0]!.info.sessionID = sid;
-    return buildCompactCacheEntry(msgs, makeCompactResult(`summary-${sid}`));
+    return buildCompactCacheEntry(
+      msgs,
+      makeCompactResult(`summary-${sid}`),
+      buildFakeFingerprint(msgs, `cfg-${sid}`),
+    );
   }
 
   test("evicts least-recently-used entry when cap is exceeded", () => {
@@ -933,12 +1043,19 @@ describe("compaction integration", () => {
     expect(compactInput.every((m) => m.content.length > 0)).toBe(true);
 
     // Incremental cache reuses exact prefixes and can extend appended ones
-    const cache = buildCompactCacheEntry(older, makeCompactResult("summary"));
-    expect(canReuseCompactCache(cache, older)).toBe(true);
+    const cache = buildCompactCacheEntry(
+      older,
+      makeCompactResult("summary"),
+      buildFakeFingerprint(older),
+    );
+    expect(
+      canReuseCompactCache(cache, older[0]!.info.sessionID, buildFakeFingerprint(older)),
+    ).toBe(true);
     expect(
       canExtendCompactCache(
         cache,
-        [...older, makeTextMsg("new-id", "user", "different")],
+        older[0]!.info.sessionID,
+        buildFakeFingerprint([...older, makeTextMsg("new-id", "user", "different")]),
       ),
     ).toBe(true);
   });
@@ -1019,6 +1136,10 @@ describe("compaction integration", () => {
             { role: "user", content: "A".repeat(100) },
             { role: "assistant", content: "B".repeat(100) },
           ]);
+          expect(firstOutput.messages[0]!.info.role).toBe("assistant");
+          expect(firstOutput.messages[0]!.parts[0]!.text).toContain(
+            "[Background context summary of 2 earlier messages.]",
+          );
 
           const secondOutput = { messages: structuredClone(baseMessages) };
           await transform({}, secondOutput);
@@ -1037,7 +1158,7 @@ describe("compaction integration", () => {
           expect(requests).toHaveLength(2);
           expect(requests[1]!.body.messages).toEqual([
             {
-              role: "user",
+              role: "assistant",
               content: "[Morph Compact summary of 2 earlier messages]\n\nsummary-1",
             },
             { role: "user", content: "C".repeat(100) },
@@ -1045,7 +1166,9 @@ describe("compaction integration", () => {
           expect(
             logs.some((entry) => entry.message.includes("Compact (incremental)")),
           ).toBe(true);
-          expect(toasts).toHaveLength(1);
+          expect(toasts).toHaveLength(2);
+          expect(toasts[1]!.variant).toBe("success");
+          expect(toasts[1]!.message).toContain("Context updated in");
         },
       );
     } finally {

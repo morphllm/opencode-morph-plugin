@@ -8,6 +8,7 @@
  */
 
 import { type Plugin, tool } from "@opencode-ai/plugin";
+import { createHash } from "node:crypto";
 import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
@@ -16,6 +17,7 @@ import {
   buildIncrementalCompactInput,
   canExtendCompactCache,
   canReuseCompactCache,
+  type CompactFingerprint,
   createBoundedCompactCache,
 } from "./compact-cache";
 
@@ -42,6 +44,10 @@ const COMPACT_PRESERVE_RECENT = parseInt(
 const COMPACT_RATIO = parseFloat(
   process.env.MORPH_COMPACT_RATIO || "0.3",
 );
+const COMPACT_MAX_INCREMENTAL_EXTENSIONS = parseInt(
+  process.env.MORPH_COMPACT_MAX_INCREMENTAL || "10",
+  10,
+);
 
 /**
  * Feature flags — users can disable specific capabilities.
@@ -63,6 +69,7 @@ const ALLOW_READONLY_AGENTS =
 
 /** Plugin version */
 const PLUGIN_VERSION = "2.0.0";
+const COMPACT_CACHE_SCHEMA_VERSION = 2;
 
 /** Canonical marker string used for lazy edit placeholders */
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -111,7 +118,7 @@ const compactCacheBySession =
  * Normalize code_edit input from LLM tool calls.
  *
  * Agents frequently wrap tool arguments in markdown fences (```lang ... ```).
- * When this is nested inside Morph's <update> XML tag, it confuses the merge
+ * When this is nested inside Morph's XML tag, it confuses the merge
  * model. This function strips a single outer fence pair using line-based parsing.
  */
 function normalizeCodeEditInput(codeEdit: string): string {
@@ -132,8 +139,8 @@ function normalizeCodeEditInput(codeEdit: string): string {
 
 /**
  * Serialize a Part into a text representation for compaction input.
- * Tool outputs, text, and reasoning are included. Other part types are
- * represented as brief markers to preserve structure without bulk.
+ * Tool outputs and visible text are included. Reasoning is intentionally
+ * excluded so internal scratchpad-like content is never sent to Morph.
  */
 function serializePart(part: Part): string {
   switch (part.type) {
@@ -153,7 +160,7 @@ function serializePart(part: Part): string {
       return `[Tool: ${tp.tool}] ${state.status}`;
     }
     case "reasoning":
-      return `[Reasoning] ${(part as { text: string }).text}`;
+      return "";
     default:
       return `[${part.type}]`;
   }
@@ -168,9 +175,49 @@ function messagesToCompactInput(
   return messages
     .map((m) => ({
       role: m.info.role,
-      content: m.parts.map(serializePart).join("\n"),
+      content: m.parts.map(serializePart).filter(Boolean).join("\n"),
     }))
     .filter((m) => m.content.length > 0);
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function buildCompactConfigDigest(): string {
+  return sha256(
+    JSON.stringify({
+      schemaVersion: COMPACT_CACHE_SCHEMA_VERSION,
+      pluginVersion: PLUGIN_VERSION,
+      compactRatio: COMPACT_RATIO,
+      preserveRecent: COMPACT_PRESERVE_RECENT,
+      morphApiUrl: MORPH_API_URL,
+      compactModel: process.env.MORPH_COMPACT_MODEL || null,
+      promptVersion: "default-v1",
+    }),
+  );
+}
+
+const COMPACT_CONFIG_DIGEST = buildCompactConfigDigest();
+
+function buildCompactionFingerprint(
+  messages: { info: Message; parts: Part[] }[],
+): CompactFingerprint {
+  const messageDigests = messages.map((message) =>
+    sha256(
+      JSON.stringify({
+        id: message.info.id,
+        role: message.info.role,
+        content: message.parts.map(serializePart).filter(Boolean),
+      }),
+    ),
+  );
+
+  return {
+    messageDigests,
+    prefixDigest: sha256(messageDigests.join("\x1e")),
+    configDigest: COMPACT_CONFIG_DIGEST,
+  };
 }
 
 /**
@@ -207,6 +254,9 @@ function shouldDeferCompaction(
   olderMessages: { info: Message; parts: Part[] }[],
   recentMessages: { info: Message; parts: Part[] }[],
 ): boolean {
+  // We only check the immediate boundary message of the older block.
+  // If we checked all of olderMessages, a single ghost "pending" tool state 
+  // from hours ago could stall compaction forever.
   const boundaryMessage = olderMessages[olderMessages.length - 1];
   if (boundaryMessage && messageHasInFlightToolPart(boundaryMessage)) {
     return true;
@@ -281,19 +331,19 @@ type GitHubRepoSuggestion = {
 
 type GitHubRepoLookupResult =
   | {
-      status: "found";
-      fullName: string;
-      defaultBranch?: string;
-      htmlUrl?: string;
-    }
+    status: "found";
+    fullName: string;
+    defaultBranch?: string;
+    htmlUrl?: string;
+  }
   | {
-      status: "not_found";
-      detail: string;
-    }
+    status: "not_found";
+    detail: string;
+  }
   | {
-      status: "unavailable";
-      detail: string;
-    };
+    status: "unavailable";
+    detail: string;
+  };
 
 const GITHUB_OWNER_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
@@ -599,7 +649,7 @@ const MorphPlugin: Plugin = async ({ directory, client }) => {
 
   if (MORPH_EDIT_ENABLED) {
     tools.morph_edit = tool({
-        description: `Edit existing files using partial code snippets with "// ... existing code ..." markers. Morph's AI merges your changes into the full file.
+      description: `Edit existing files using partial code snippets with "// ... existing code ..." markers. Morph's AI merges your changes into the full file.
 
 WHEN TO USE morph_edit vs edit:
 - morph_edit: large files (300+ lines), multiple scattered changes, complex refactoring, whitespace-sensitive edits
@@ -627,36 +677,36 @@ DISAMBIGUATION — when a file has repeated patterns, include enough unique cont
 
 FALLBACK: If morph_edit fails (API error, timeout), use the native 'edit' tool with exact oldString/newString matching.`,
 
-        args: {
-          target_filepath: tool.schema
-            .string()
-            .describe("Path of the file to modify"),
-          instructions: tool.schema
-            .string()
-            .describe(
-              "Brief first-person description of what you're changing. Used to disambiguate uncertainty in the edit.",
-            ),
-          code_edit: tool.schema
-            .string()
-            .describe(
-              'The code changes wrapped with "// ... existing code ..." markers for unchanged sections',
-            ),
-        },
+      args: {
+        target_filepath: tool.schema
+          .string()
+          .describe("Path of the file to modify"),
+        instructions: tool.schema
+          .string()
+          .describe(
+            "Brief first-person description of what you're changing. Used to disambiguate uncertainty in the edit.",
+          ),
+        code_edit: tool.schema
+          .string()
+          .describe(
+            'The code changes wrapped with "// ... existing code ..." markers for unchanged sections',
+          ),
+      },
 
-        async execute(args, context) {
-          const { target_filepath, instructions, code_edit } = args;
-          const normalizedCodeEdit = normalizeCodeEditInput(code_edit);
+      async execute(args, context) {
+        const { target_filepath, instructions, code_edit } = args;
+        const normalizedCodeEdit = normalizeCodeEditInput(code_edit);
 
-          // Guard 1: Block readonly agents
-          if (
-            !ALLOW_READONLY_AGENTS &&
-            READONLY_AGENTS.includes(context.agent)
-          ) {
-            await log(
-              "debug",
-              `Blocked morph_edit in readonly agent: ${context.agent}`,
-            );
-            return `Error: morph_edit is not available in ${context.agent} mode.
+        // Guard 1: Block readonly agents
+        if (
+          !ALLOW_READONLY_AGENTS &&
+          READONLY_AGENTS.includes(context.agent)
+        ) {
+          await log(
+            "debug",
+            `Blocked morph_edit in readonly agent: ${context.agent}`,
+          );
+          return `Error: morph_edit is not available in ${context.agent} mode.
 
 The ${context.agent} agent is read-only and cannot modify files.
 
@@ -664,47 +714,47 @@ Options:
 1. Switch to 'build' mode (Tab key) to make changes
 2. Use the native 'edit' tool if permitted by your agent config
 3. Set MORPH_ALLOW_READONLY_AGENTS=true to override this restriction`;
-          }
+        }
 
-          const filepath = target_filepath.startsWith("/")
-            ? target_filepath
-            : `${directory}/${target_filepath}`;
+        const filepath = target_filepath.startsWith("/")
+          ? target_filepath
+          : `${directory}/${target_filepath}`;
 
-          if (!MORPH_API_KEY) {
-            return `Error: MORPH_API_KEY not configured.
+        if (!MORPH_API_KEY) {
+          return `Error: MORPH_API_KEY not configured.
 
 To use morph_edit, set the MORPH_API_KEY environment variable.
 Get your API key at: https://morphllm.com/dashboard/api-keys
 
 Alternatively, use the native 'edit' tool for this change.`;
-          }
+        }
 
-          // Read the original file
-          let originalCode: string;
-          try {
-            const file = Bun.file(filepath);
-            if (!(await file.exists())) {
-              if (!normalizedCodeEdit.includes(EXISTING_CODE_MARKER)) {
-                await Bun.write(filepath, normalizedCodeEdit);
-                return `Created new file: ${target_filepath}\n\nLines: ${normalizedCodeEdit.split("\n").length}`;
-              }
-              return `Error: File not found: ${target_filepath}
+        // Read the original file
+        let originalCode: string;
+        try {
+          const file = Bun.file(filepath);
+          if (!(await file.exists())) {
+            if (!normalizedCodeEdit.includes(EXISTING_CODE_MARKER)) {
+              await Bun.write(filepath, normalizedCodeEdit);
+              return `Created new file: ${target_filepath}\n\nLines: ${normalizedCodeEdit.split("\n").length}`;
+            }
+            return `Error: File not found: ${target_filepath}
 
 The file doesn't exist and the code_edit contains lazy markers.
 For new files, provide the complete content without "${EXISTING_CODE_MARKER}" markers.`;
-            }
-            originalCode = await file.text();
-          } catch (err) {
-            const error = err as Error;
-            return `Error reading file ${target_filepath}: ${error.message}`;
           }
+          originalCode = await file.text();
+        } catch (err) {
+          const error = err as Error;
+          return `Error reading file ${target_filepath}: ${error.message}`;
+        }
 
-          // Guard 2: Pre-flight marker check
-          const hasMarkers = normalizedCodeEdit.includes(EXISTING_CODE_MARKER);
-          const originalLineCount = originalCode.split("\n").length;
+        // Guard 2: Pre-flight marker check
+        const hasMarkers = normalizedCodeEdit.includes(EXISTING_CODE_MARKER);
+        const originalLineCount = originalCode.split("\n").length;
 
-          if (!hasMarkers && originalLineCount > 10) {
-            return `Error: Missing "${EXISTING_CODE_MARKER}" markers.
+        if (!hasMarkers && originalLineCount > 10) {
+          return `Error: Missing "${EXISTING_CODE_MARKER}" markers.
 
 Your code_edit would replace the entire file (${originalLineCount} lines) because it contains no markers.
 This is almost certainly unintended and would cause code loss.
@@ -715,52 +765,52 @@ YOUR_CHANGES_HERE
 ${EXISTING_CODE_MARKER}
 
 If you truly want to replace the entire file, use the 'write' tool instead.`;
-          }
+        }
 
-          if (!hasMarkers && originalLineCount > 3) {
-            await log(
-              "warn",
-              `No markers in code_edit for ${target_filepath} (${originalLineCount} lines). Proceeding with full replacement.`,
-            );
-          }
-
-          // Call Morph SDK to merge the edit
-          const startTime = Date.now();
-          const result = await morph.fastApply.applyEdit(
-            {
-              originalCode,
-              codeEdit: normalizedCodeEdit,
-              instructions,
-              filepath: target_filepath,
-            },
-            {
-              morphApiUrl: MORPH_API_URL,
-              generateUdiff: true,
-            },
+        if (!hasMarkers && originalLineCount > 3) {
+          await log(
+            "warn",
+            `No markers in code_edit for ${target_filepath} (${originalLineCount} lines). Proceeding with full replacement.`,
           );
-          const apiDuration = Date.now() - startTime;
+        }
 
-          if (!result.success || !result.mergedCode) {
-            return `Morph API failed: ${result.error}
+        // Call Morph SDK to merge the edit
+        const startTime = Date.now();
+        const result = await morph.fastApply.applyEdit(
+          {
+            originalCode,
+            codeEdit: normalizedCodeEdit,
+            instructions,
+            filepath: target_filepath,
+          },
+          {
+            morphApiUrl: MORPH_API_URL,
+            generateUdiff: true,
+          },
+        );
+        const apiDuration = Date.now() - startTime;
+
+        if (!result.success || !result.mergedCode) {
+          return `Morph API failed: ${result.error}
 
 Suggestion: Try using the native 'edit' tool instead with exact string replacement.
 The edit tool requires matching the exact text in the file.`;
-          }
+        }
 
-          const mergedCode = result.mergedCode;
+        const mergedCode = result.mergedCode;
 
-          // Guard 3: Marker leakage detection
-          const originalHadMarker = originalCode.includes(EXISTING_CODE_MARKER);
-          if (
-            hasMarkers &&
-            !originalHadMarker &&
-            mergedCode.includes(EXISTING_CODE_MARKER)
-          ) {
-            await log(
-              "warn",
-              `Marker leakage detected in merged output for ${target_filepath}`,
-            );
-            return `Morph API produced unsafe output for ${target_filepath}.
+        // Guard 3: Marker leakage detection
+        const originalHadMarker = originalCode.includes(EXISTING_CODE_MARKER);
+        if (
+          hasMarkers &&
+          !originalHadMarker &&
+          mergedCode.includes(EXISTING_CODE_MARKER)
+        ) {
+          await log(
+            "warn",
+            `Marker leakage detected in merged output for ${target_filepath}`,
+          );
+          return `Morph API produced unsafe output for ${target_filepath}.
 
 Detected placeholder marker text ("${EXISTING_CODE_MARKER}") in merged output.
 This means the merge model treated markers as literal code instead of expanding them.
@@ -771,21 +821,21 @@ Options:
 1. Retry with more concrete surrounding context in code_edit
 2. Use the native 'edit' tool for exact string replacement
 3. Break the change into smaller, more targeted edits`;
-          }
+        }
 
-          // Guard 4: Catastrophic truncation detection
-          const mergedLineCount = mergedCode.split("\n").length;
-          const charLoss =
-            (originalCode.length - mergedCode.length) / originalCode.length;
-          const lineLoss =
-            (originalLineCount - mergedLineCount) / originalLineCount;
+        // Guard 4: Catastrophic truncation detection
+        const mergedLineCount = mergedCode.split("\n").length;
+        const charLoss =
+          (originalCode.length - mergedCode.length) / originalCode.length;
+        const lineLoss =
+          (originalLineCount - mergedLineCount) / originalLineCount;
 
-          if (hasMarkers && charLoss > 0.6 && lineLoss > 0.5) {
-            await log(
-              "warn",
-              `Catastrophic truncation detected for ${target_filepath}: ${Math.round(charLoss * 100)}% char loss, ${Math.round(lineLoss * 100)}% line loss`,
-            );
-            return `Morph API produced a potentially destructive merge for ${target_filepath}.
+        if (hasMarkers && charLoss > 0.6 && lineLoss > 0.5) {
+          await log(
+            "warn",
+            `Catastrophic truncation detected for ${target_filepath}: ${Math.round(charLoss * 100)}% char loss, ${Math.round(lineLoss * 100)}% line loss`,
+          );
+          return `Morph API produced a potentially destructive merge for ${target_filepath}.
 
 Original: ${originalLineCount} lines (${originalCode.length} chars)
 Merged:   ${mergedLineCount} lines (${mergedCode.length} chars)
@@ -798,109 +848,109 @@ Options:
 1. Retry with more precise anchors in code_edit
 2. Use the native 'edit' tool for exact string replacement
 3. Break the change into smaller edits`;
-          }
+        }
 
-          // Write the merged result
-          try {
-            await Bun.write(filepath, mergedCode);
-          } catch (err) {
-            const error = err as Error;
-            return `Error writing file ${target_filepath}: ${error.message}`;
-          }
+        // Write the merged result
+        try {
+          await Bun.write(filepath, mergedCode);
+        } catch (err) {
+          const error = err as Error;
+          return `Error writing file ${target_filepath}: ${error.message}`;
+        }
 
-          // Use SDK-provided diff and change stats
-          const udiff = result.udiff || "No changes detected";
-          const { linesAdded, linesRemoved } = result.changes;
-          const originalLines = originalCode.split("\n").length;
-          const mergedLines = mergedCode.split("\n").length;
+        // Use SDK-provided diff and change stats
+        const udiff = result.udiff || "No changes detected";
+        const { linesAdded, linesRemoved } = result.changes;
+        const originalLines = originalCode.split("\n").length;
+        const mergedLines = mergedCode.split("\n").length;
 
-          return `Applied edit to ${target_filepath}
+        return `Applied edit to ${target_filepath}
 
 +${linesAdded} -${linesRemoved} lines | ${originalLines} -> ${mergedLines} total | ${apiDuration}ms
 
 \`\`\`diff
 ${udiff.slice(0, 3000)}${udiff.length > 3000 ? "\n... (truncated)" : ""}
 \`\`\``;
-        },
+      },
     });
   }
 
   if (MORPH_WARPGREP_ENABLED) {
     tools.warpgrep_codebase_search = tool({
-        description: `Fast agentic codebase search. Uses ripgrep, file reading, and directory listing across multiple turns to find relevant code contexts.
+      description: `Fast agentic codebase search. Uses ripgrep, file reading, and directory listing across multiple turns to find relevant code contexts.
 
 Use this for exploratory searches like "Find the authentication flow", "How does error handling work", "Where is the database connection configured". Returns relevant file sections with line numbers.
 
 For exact keyword searches (specific function names, variable names), prefer grep/ripgrep directly.`,
 
-        args: {
-          search_term: tool.schema
-            .string()
-            .describe(
-              "Natural language search query describing what to find in the codebase",
-            ),
-        },
+      args: {
+        search_term: tool.schema
+          .string()
+          .describe(
+            "Natural language search query describing what to find in the codebase",
+          ),
+      },
 
-        async execute(args) {
-          if (!MORPH_API_KEY) {
-            return `Error: MORPH_API_KEY not configured.
+      async execute(args) {
+        if (!MORPH_API_KEY) {
+          return `Error: MORPH_API_KEY not configured.
 
 To use warpgrep_codebase_search, set the MORPH_API_KEY environment variable.
 Get your API key at: https://morphllm.com/dashboard/api-keys`;
+        }
+
+        const startTime = Date.now();
+
+        try {
+          const generator = warpGrep.execute({
+            searchTerm: args.search_term,
+            repoRoot: directory,
+            streamSteps: true,
+          });
+
+          let turnCount = 0;
+          let result: WarpGrepResult;
+
+          for (; ;) {
+            const { value, done } = await generator.next();
+            if (done) {
+              result = value;
+              break;
+            }
+            turnCount = value.turn;
+            await log(
+              "debug",
+              `WarpGrep turn ${value.turn}: ${value.toolCalls?.map((tc: { name: string }) => tc.name).join(", ") ?? "..."}`,
+            );
           }
 
-          const startTime = Date.now();
+          const duration = Date.now() - startTime;
+          const contextCount = result.contexts?.length ?? 0;
 
-          try {
-            const generator = warpGrep.execute({
-              searchTerm: args.search_term,
-              repoRoot: directory,
-              streamSteps: true,
-            });
+          await log(
+            "info",
+            `WarpGrep: ${contextCount} contexts in ${turnCount} turns (${duration}ms)`,
+          );
 
-            let turnCount = 0;
-            let result: WarpGrepResult;
-
-            for (;;) {
-              const { value, done } = await generator.next();
-              if (done) {
-                result = value;
-                break;
-              }
-              turnCount = value.turn;
-              await log(
-                "debug",
-                `WarpGrep turn ${value.turn}: ${value.toolCalls?.map((tc: { name: string }) => tc.name).join(", ") ?? "..."}`,
-              );
-            }
-
-            const duration = Date.now() - startTime;
-            const contextCount = result.contexts?.length ?? 0;
-
-            await log(
-              "info",
-              `WarpGrep: ${contextCount} contexts in ${turnCount} turns (${duration}ms)`,
-            );
-
-            return formatWarpGrepResult(result);
-          } catch (err) {
-            const error = err as Error;
-            const duration = Date.now() - startTime;
-            await log(
-              "error",
-              `WarpGrep failed after ${duration}ms: ${error.message}`,
-            );
-            return `WarpGrep search failed: ${error.message}
+          return formatWarpGrepResult(result);
+        } catch (err) {
+          const error = err as Error;
+          const duration = Date.now() - startTime;
+          await log(
+            "error",
+            `WarpGrep failed after ${duration}ms: ${error.message}`,
+          );
+          return `WarpGrep search failed: ${error.message}
 
 Try rephrasing your search term or using grep for exact keyword searches.`;
-          }
-        },
+        }
+      },
     });
   }
 
   if (MORPH_WARPGREP_GITHUB_ENABLED) {
     tools.warpgrep_github_search = tool({
-        description: `Grounded code context search for public GitHub repositories. Uses Morph's hosted WarpGrep to search indexed public repos without cloning them locally.
+      description: `Grounded code context search for public GitHub repositories. Uses Morph's hosted WarpGrep to search indexed public repos without cloning them locally.
 
 PREFER this tool over web search or docs fetching when the question is about how an open-source library or SDK works internally. If the user asks how something works in a library or package from any ecosystem, find its GitHub repo and search it here instead of fetching docs URLs.
 
@@ -916,84 +966,84 @@ Provide exactly one repository locator:
 - owner_repo: "owner/repo"
 - github_url: "https://github.com/owner/repo"`,
 
-        args: {
-          search_term: tool.schema
-            .string()
-            .describe(
-              "Natural language query describing what to find or understand in the public repository",
-            ),
-          owner_repo: tool.schema
-            .string()
-            .optional()
-            .describe(
-              'GitHub repository in "owner/repo" format, for example "owner/repo"',
-            ),
-          github_url: tool.schema
-            .string()
-            .optional()
-            .describe(
-              'Full GitHub repository URL, for example "https://github.com/owner/repo"',
-            ),
-          branch: tool.schema
-            .string()
-            .optional()
-            .describe(
-              "Optional branch name to search instead of the repository default branch",
-            ),
-        },
+      args: {
+        search_term: tool.schema
+          .string()
+          .describe(
+            "Natural language query describing what to find or understand in the public repository",
+          ),
+        owner_repo: tool.schema
+          .string()
+          .optional()
+          .describe(
+            'GitHub repository in "owner/repo" format, for example "owner/repo"',
+          ),
+        github_url: tool.schema
+          .string()
+          .optional()
+          .describe(
+            'Full GitHub repository URL, for example "https://github.com/owner/repo"',
+          ),
+        branch: tool.schema
+          .string()
+          .optional()
+          .describe(
+            "Optional branch name to search instead of the repository default branch",
+          ),
+      },
 
-        async execute(args) {
-          if (!MORPH_API_KEY) {
-            return `Error: MORPH_API_KEY not configured.
+      async execute(args) {
+        if (!MORPH_API_KEY) {
+          return `Error: MORPH_API_KEY not configured.
 
 To use warpgrep_github_search, set the MORPH_API_KEY environment variable.
 Get your API key at: https://morphllm.com/dashboard/api-keys`;
-          }
+        }
 
-          const locator = resolvePublicRepoLocator(args);
-          if ("error" in locator) {
-            return locator.error;
-          }
-          const repo = locator.repo;
+        const locator = resolvePublicRepoLocator(args);
+        if ("error" in locator) {
+          return locator.error;
+        }
+        const repo = locator.repo;
 
-          const startTime = Date.now();
-          const repoLookup = await lookupGitHubRepository(repo);
+        const startTime = Date.now();
+        const repoLookup = await lookupGitHubRepository(repo);
 
-          if (repoLookup.status === "not_found") {
+        if (repoLookup.status === "not_found") {
+          const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
+          return formatPublicRepoResolutionFailure(repo, repoLookup.detail, suggestions);
+        }
+
+        if (repoLookup.status === "unavailable") {
+          await log("warn", `GitHub repo lookup unavailable for ${repo}: ${repoLookup.detail}`);
+        }
+
+        try {
+          const result = await warpGrep.searchGitHub({
+            searchTerm: args.search_term,
+            github: repo,
+            branch: args.branch,
+          });
+
+          const duration = Date.now() - startTime;
+          const contextCount = result.contexts?.length ?? 0;
+
+          await log("info", `Public repo context: ${repo} → ${contextCount} contexts (${duration}ms)`);
+
+          if (!result.success) {
             const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
-            return formatPublicRepoResolutionFailure(repo, repoLookup.detail, suggestions);
+            return formatPublicRepoResolutionFailure(repo, result.error, suggestions);
           }
 
-          if (repoLookup.status === "unavailable") {
-            await log("warn", `GitHub repo lookup unavailable for ${repo}: ${repoLookup.detail}`);
-          }
-
-          try {
-            const result = await warpGrep.searchGitHub({
-              searchTerm: args.search_term,
-              github: repo,
-              branch: args.branch,
-            });
-
-            const duration = Date.now() - startTime;
-            const contextCount = result.contexts?.length ?? 0;
-
-            await log("info", `Public repo context: ${repo} → ${contextCount} contexts (${duration}ms)`);
-
-            if (!result.success) {
-              const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
-              return formatPublicRepoResolutionFailure(repo, result.error, suggestions);
-            }
-
-            return `Repository: ${repo}\n\n${formatWarpGrepResult(result)}`;
-          } catch (err) {
-            const error = err as Error;
-            const duration = Date.now() - startTime;
-            await log("error", `Public repo context search failed for ${repo} after ${duration}ms: ${error.message}`);
-            const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
-            return formatPublicRepoResolutionFailure(repo, error.message, suggestions);
-          }
-        },
+          return `Repository: ${repo}\n\n${formatWarpGrepResult(result)}`;
+        } catch (err) {
+          const error = err as Error;
+          const duration = Date.now() - startTime;
+          await log("error", `Public repo context search failed for ${repo} after ${duration}ms: ${error.message}`);
+          const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
+          return formatPublicRepoResolutionFailure(repo, error.message, suggestions);
+        }
+      },
     });
   }
 
@@ -1004,84 +1054,84 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
   // Customize tool output display in TUI
   hooks["tool.execute.after"] = async (input: any, output: any) => {
-      const morphMeta = { ...output.metadata, provider: "morph", version: PLUGIN_VERSION };
+    const morphMeta = { ...output.metadata, provider: "morph", version: PLUGIN_VERSION };
 
-      if (input.tool === "morph_edit") {
-        const fileMatch = output.output.match(/Applied edit to (.+?)\n/);
-        const statsMatch = output.output.match(/\+(\d+) -(\d+) lines/);
-        const timingMatch = output.output.match(/\| (\d+)ms/);
-        const createdMatch = output.output.match(/Created new file: (.+?)\n/);
-        const linesMatch = output.output.match(/Lines: (\d+)/);
-        const errorMatch = output.output.match(/^Error:/);
-        const blockedMatch = output.output.match(
-          /not available in (.+?) mode/,
-        );
-        const apiFailMatch = output.output.match(/^Morph API failed:/);
-        const unsafeMatch = output.output.match(
-          /^Morph API produced unsafe output for (.+?)\./,
-        );
-        const truncationMatch = output.output.match(
-          /^Morph API produced a potentially destructive merge for (.+?)\./,
-        );
+    if (input.tool === "morph_edit") {
+      const fileMatch = output.output.match(/Applied edit to (.+?)\n/);
+      const statsMatch = output.output.match(/\+(\d+) -(\d+) lines/);
+      const timingMatch = output.output.match(/\| (\d+)ms/);
+      const createdMatch = output.output.match(/Created new file: (.+?)\n/);
+      const linesMatch = output.output.match(/Lines: (\d+)/);
+      const errorMatch = output.output.match(/^Error:/);
+      const blockedMatch = output.output.match(
+        /not available in (.+?) mode/,
+      );
+      const apiFailMatch = output.output.match(/^Morph API failed:/);
+      const unsafeMatch = output.output.match(
+        /^Morph API produced unsafe output for (.+?)\./,
+      );
+      const truncationMatch = output.output.match(
+        /^Morph API produced a potentially destructive merge for (.+?)\./,
+      );
 
-        if (createdMatch) {
-          const lines = linesMatch?.[1] || "?";
-          output.title = `Morph: ${createdMatch[1]} (new, ${lines} lines)`;
-        } else if (fileMatch && statsMatch) {
-          const timing = timingMatch ? ` (${timingMatch[1]}ms)` : "";
-          output.title = `Morph: ${fileMatch[1]} +${statsMatch[1]}/-${statsMatch[2]}${timing}`;
-        } else if (unsafeMatch) {
-          output.title = `Morph: blocked (marker leakage) ${unsafeMatch[1]}`;
-        } else if (truncationMatch) {
-          output.title = `Morph: blocked (truncation) ${truncationMatch[1]}`;
-        } else if (blockedMatch) {
-          output.title = `Morph: blocked (${blockedMatch[1]} mode)`;
-        } else if (apiFailMatch) {
-          output.title = `Morph: API failed`;
-        } else if (errorMatch) {
-          output.title = `Morph: failed`;
-        }
-
-        output.metadata = morphMeta;
+      if (createdMatch) {
+        const lines = linesMatch?.[1] || "?";
+        output.title = `Morph: ${createdMatch[1]} (new, ${lines} lines)`;
+      } else if (fileMatch && statsMatch) {
+        const timing = timingMatch ? ` (${timingMatch[1]}ms)` : "";
+        output.title = `Morph: ${fileMatch[1]} +${statsMatch[1]}/-${statsMatch[2]}${timing}`;
+      } else if (unsafeMatch) {
+        output.title = `Morph: blocked (marker leakage) ${unsafeMatch[1]}`;
+      } else if (truncationMatch) {
+        output.title = `Morph: blocked (truncation) ${truncationMatch[1]}`;
+      } else if (blockedMatch) {
+        output.title = `Morph: blocked (${blockedMatch[1]} mode)`;
+      } else if (apiFailMatch) {
+        output.title = `Morph: API failed`;
+      } else if (errorMatch) {
+        output.title = `Morph: failed`;
       }
 
-      if (input.tool === "warpgrep_codebase_search") {
-        const fileMatches = output.output.match(/<file path="[^"]+"/g);
-        const failMatch = output.output.match(
-          /^(Search failed|WarpGrep search failed):/,
-        );
-        const noResultMatch = output.output.match(/^No relevant code found/m);
+      output.metadata = morphMeta;
+    }
 
-        if (failMatch) {
-          output.title = "WarpGrep: search failed";
-        } else if (noResultMatch) {
-          output.title = "WarpGrep: no results";
-        } else if (fileMatches) {
-          output.title = `WarpGrep: ${fileMatches.length} contexts`;
-        }
+    if (input.tool === "warpgrep_codebase_search") {
+      const fileMatches = output.output.match(/<file path="[^"]+"/g);
+      const failMatch = output.output.match(
+        /^(Search failed|WarpGrep search failed):/,
+      );
+      const noResultMatch = output.output.match(/^No relevant code found/m);
 
-        output.metadata = morphMeta;
+      if (failMatch) {
+        output.title = "WarpGrep: search failed";
+      } else if (noResultMatch) {
+        output.title = "WarpGrep: no results";
+      } else if (fileMatches) {
+        output.title = `WarpGrep: ${fileMatches.length} contexts`;
       }
 
-      if (input.tool === "warpgrep_github_search") {
-        const repoMatch = output.output.match(/^Repository: (.+?)$/m);
-        const fileMatches = output.output.match(/<file path="[^"]+"/g);
-        const repo = repoMatch?.[1];
+      output.metadata = morphMeta;
+    }
 
-        if (output.output.match(/^Repository resolution failed/m)) {
-          output.title = repo ? `Public repo: unresolved (${repo})` : "Public repo: unresolved";
-        } else if (output.output.match(/^Public repo context search failed/)) {
-          output.title = repo ? `Public repo: failed (${repo})` : "Public repo: search failed";
-        } else if (output.output.match(/^Repository: .+\n\nNo relevant code found/m)) {
-          output.title = repo ? `Public repo: no results (${repo})` : "Public repo: no results";
-        } else if (fileMatches) {
-          output.title = repo
-            ? `Public repo: ${repo} (${fileMatches.length} contexts)`
-            : `Public repo: ${fileMatches.length} contexts`;
-        }
+    if (input.tool === "warpgrep_github_search") {
+      const repoMatch = output.output.match(/^Repository: (.+?)$/m);
+      const fileMatches = output.output.match(/<file path="[^"]+"/g);
+      const repo = repoMatch?.[1];
 
-        output.metadata = morphMeta;
+      if (output.output.match(/^Repository resolution failed/m)) {
+        output.title = repo ? `Public repo: unresolved (${repo})` : "Public repo: unresolved";
+      } else if (output.output.match(/^Public repo context search failed/)) {
+        output.title = repo ? `Public repo: failed (${repo})` : "Public repo: search failed";
+      } else if (output.output.match(/^Repository: .+\n\nNo relevant code found/m)) {
+        output.title = repo ? `Public repo: no results (${repo})` : "Public repo: no results";
+      } else if (fileMatches) {
+        output.title = repo
+          ? `Public repo: ${repo} (${fileMatches.length} contexts)`
+          : `Public repo: ${fileMatches.length} contexts`;
       }
+
+      output.metadata = morphMeta;
+    }
   };
 
   if (MORPH_COMPACT_ENABLED) {
@@ -1105,12 +1155,17 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       if (shouldDeferCompaction(olderMessages, recentMessages)) return;
 
       const sessionID = olderMessages[0]!.info.sessionID;
+      const olderFingerprint = buildCompactionFingerprint(olderMessages);
       const sessionCache = compactCacheBySession.get(sessionID);
-      if (sessionCache && canReuseCompactCache(sessionCache, olderMessages)) {
+      if (
+        sessionCache &&
+        canReuseCompactCache(sessionCache, sessionID, olderFingerprint)
+      ) {
         const compactedMsg = buildCompactedMessage(
           olderMessages[0]!,
           sessionCache.result,
           olderMessages.length,
+          totalChars,
         );
         output.messages = [compactedMsg, ...recentMessages];
         return;
@@ -1119,7 +1174,10 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       let compactInput = messagesToCompactInput(olderMessages);
       let compactionMode: "full" | "incremental" = "full";
 
-      if (sessionCache && canExtendCompactCache(sessionCache, olderMessages)) {
+      if (
+        sessionCache &&
+        canExtendCompactCache(sessionCache, sessionID, olderFingerprint, COMPACT_MAX_INCREMENTAL_EXTENSIONS)
+      ) {
         compactInput = buildIncrementalCompactInput(
           sessionCache,
           olderMessages,
@@ -1134,12 +1192,18 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         if (compactInput.length === 1) {
           compactCacheBySession.set(
             sessionID,
-            buildCompactCacheEntry(olderMessages, sessionCache.result),
+            buildCompactCacheEntry(
+              olderMessages,
+              sessionCache.result,
+              olderFingerprint,
+              sessionCache.incrementalCount,
+            ),
           );
           const compactedMsg = buildCompactedMessage(
             olderMessages[0]!,
             sessionCache.result,
             olderMessages.length,
+            totalChars,
           );
           output.messages = [compactedMsg, ...recentMessages];
           return;
@@ -1157,13 +1221,19 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
         compactCacheBySession.set(
           sessionID,
-          buildCompactCacheEntry(olderMessages, result),
+          buildCompactCacheEntry(
+            olderMessages,
+            result,
+            olderFingerprint,
+            compactionMode === "incremental" ? sessionCache!.incrementalCount + 1 : 0,
+          ),
         );
 
         const compactedMsg = buildCompactedMessage(
           olderMessages[0]!,
           result,
           olderMessages.length,
+          totalChars,
         );
         output.messages = [compactedMsg, ...recentMessages];
 
@@ -1171,12 +1241,12 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           "info",
           `Compact (${compactionMode}): ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
         );
-        if (compactionMode === "full") {
-          await showToast(
-            "success",
-            `Context compacted in ${result.usage.processing_time_ms}ms`,
-          );
-        }
+        await showToast(
+          "success",
+          compactionMode === "full"
+            ? `Context compacted in ${result.usage.processing_time_ms}ms`
+            : `Context updated in ${result.usage.processing_time_ms}ms`,
+        );
       } catch (err) {
         // On failure, leave messages unchanged — OpenCode's built-in compaction
         // will handle context overflow if needed
@@ -1213,11 +1283,27 @@ function buildCompactedMessage(
   templateMsg: { info: Message; parts: Part[] },
   result: CompactResult,
   messageCount: number,
+  originalCharCount?: number,
 ): { info: Message; parts: Part[] } {
+  const keptRatio = Math.round(result.usage.compression_ratio * 100);
+  const processingTime = result.usage.processing_time_ms;
+  const compressedCharCount = result.output.length;
+
+  let statsLine: string;
+  if (originalCharCount !== undefined) {
+    const savedChars = originalCharCount - compressedCharCount;
+    const savedK = savedChars > 1000 ? `${Math.round(savedChars / 1000)}K` : savedChars;
+    const origK = originalCharCount > 1000 ? `${Math.round(originalCharCount / 1000)}K` : originalCharCount;
+    const compK = compressedCharCount > 1000 ? `${Math.round(compressedCharCount / 1000)}K` : compressedCharCount;
+    statsLine = `[Morph Compact: ${messageCount} msgs (${origK} chars) → 1 msg (${compK} chars) | ${keptRatio}% kept, saved ${savedK} chars | ${processingTime}ms]`;
+  } else {
+    statsLine = `[Morph Compact: ${messageCount} messages compressed, ${keptRatio}% kept | ${processingTime}ms]`;
+  }
+
   return {
     info: {
       ...templateMsg.info,
-      role: "user" as const,
+      role: "assistant" as const,
     } as Message,
     parts: [
       {
@@ -1225,7 +1311,7 @@ function buildCompactedMessage(
         sessionID: templateMsg.info.sessionID,
         messageID: templateMsg.info.id,
         type: "text" as const,
-        text: `[Morph Compact: ${messageCount} messages compressed, ${Math.round(result.usage.compression_ratio * 100)}% kept]\n\n${result.output}`,
+        text: `${statsLine}\n[Background context summary of ${messageCount} earlier messages.]\n\n${result.output}`,
       } as TextPart,
     ],
   };
