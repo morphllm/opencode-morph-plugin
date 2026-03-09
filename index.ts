@@ -1208,6 +1208,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       // Batch uncached messages into chunks of COMPACT_CHUNK_SIZE
       const newChunks: ChunkSummary[] = [];
+      let totalCompactTime = 0;
       for (let i = 0; i < uncachedMessages.length; i += COMPACT_CHUNK_SIZE) {
         const batch = uncachedMessages.slice(i, i + COMPACT_CHUNK_SIZE);
         const compactInput = messagesToCompactInput(batch);
@@ -1231,6 +1232,8 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
             output: result.output,
             charCountSaved: estimateTotalChars(batch) - result.output.length,
           });
+
+          totalCompactTime += result.usage.processing_time_ms;
 
           await log(
             "info",
@@ -1272,7 +1275,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       await showToast(
         "success",
-        `${allChunks.length} chunks (${totalCompactedMessages} msgs compacted)`,
+        `${allChunks.length} chunks (${totalCompactedMessages} msgs compacted) | ${totalCompactTime}ms`,
       );
     };
 
