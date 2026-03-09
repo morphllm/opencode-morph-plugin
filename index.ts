@@ -237,9 +237,7 @@ type PublicRepoContextSearchArgs = {
   branch?: string;
 };
 
-type ResolvedPublicRepoLocator = {
-  github: string;
-};
+type GitHubRepo = string; // "owner/repo"
 
 type GitHubRepoSuggestion = {
   fullName: string;
@@ -276,10 +274,10 @@ function tokenizeSuggestionQuery(text: string): string[] {
 }
 
 function buildGitHubSuggestionQueries(
-  repo: ResolvedPublicRepoLocator,
+  repo: GitHubRepo,
   searchTerm: string,
 ): string[] {
-  const [owner, repoName] = repo.github.split("/");
+  const [owner, repoName] = repo.split("/");
   const searchTokens = tokenizeSuggestionQuery(searchTerm).slice(0, 3);
   const queries = new Set<string>();
 
@@ -293,25 +291,13 @@ function buildGitHubSuggestionQueries(
   return Array.from(queries).slice(0, 4);
 }
 
-function isNotFoundError(error: string): boolean {
-  const normalized = error.toLowerCase();
-  return (
-    normalized.includes("not found") ||
-    normalized.includes("404") ||
-    normalized.includes("does not exist") ||
-    normalized.includes("could not resolve") ||
-    normalized.includes("failed to resolve") ||
-    normalized.includes("repository resolution")
-  );
-}
-
 function formatPublicRepoResolutionFailure(
-  repo: ResolvedPublicRepoLocator,
+  repo: GitHubRepo,
   detail?: string,
   suggestions: GitHubRepoSuggestion[] = [],
 ): string {
   const parts: string[] = [
-    `Repository resolution failed for ${repo.github}.\n\nThis locator did not resolve to a public GitHub repository that Morph can search.`,
+    `Repository resolution failed for ${repo}.\n\nThis locator did not resolve to a public GitHub repository that Morph can search.`,
   ];
   if (detail) parts.push(`Resolver detail: ${detail}`);
   if (suggestions.length > 0) {
@@ -324,7 +310,7 @@ function formatPublicRepoResolutionFailure(
 
 function resolvePublicRepoLocator(
   args: PublicRepoContextSearchArgs,
-): { repo: ResolvedPublicRepoLocator } | { error: string } {
+): { repo: GitHubRepo } | { error: string } {
   const ownerRepo = args.owner_repo?.trim();
   const githubUrl = args.github_url?.trim();
 
@@ -362,11 +348,7 @@ If you have a full URL, use github_url instead.`,
       };
     }
 
-    return {
-      repo: {
-        github: ownerRepo,
-      },
-    };
+    return { repo: ownerRepo };
   }
 
   let parsed: URL;
@@ -422,11 +404,7 @@ Received: "${githubUrl}"`,
     };
   }
 
-  return {
-    repo: {
-      github: canonicalRepo,
-    },
-  };
+  return { repo: canonicalRepo };
 }
 
 function githubHeaders(): Record<string, string> {
@@ -447,11 +425,11 @@ async function withGitHubTimeout<T>(fn: (signal: AbortSignal) => Promise<T>): Pr
 }
 
 async function lookupGitHubRepository(
-  repo: ResolvedPublicRepoLocator,
+  repo: GitHubRepo,
 ): Promise<GitHubRepoLookupResult> {
   return withGitHubTimeout(async (signal) => {
     try {
-      const response = await fetch(`${GITHUB_REPO_API_URL}/${repo.github}`, {
+      const response = await fetch(`${GITHUB_REPO_API_URL}/${repo}`, {
         headers: githubHeaders(),
         signal,
       });
@@ -467,7 +445,7 @@ async function lookupGitHubRepository(
 
       return {
         status: "found",
-        fullName: body.full_name || repo.github,
+        fullName: body.full_name || repo,
         defaultBranch: body.default_branch,
         htmlUrl: body.html_url,
       };
@@ -479,56 +457,57 @@ async function lookupGitHubRepository(
 }
 
 async function fetchGitHubRepoSuggestions(
-  repo: ResolvedPublicRepoLocator,
+  repo: GitHubRepo,
   searchTerm: string,
 ): Promise<GitHubRepoSuggestion[]> {
   return withGitHubTimeout(async (signal) => {
-    const candidates = new Map<string, GitHubRepoSuggestion>();
     const queries = buildGitHubSuggestionQueries(repo, searchTerm);
 
-    for (const query of queries) {
-      const url = new URL(GITHUB_REPO_SEARCH_URL);
-      url.searchParams.set("q", query);
-      url.searchParams.set("sort", "stars");
-      url.searchParams.set("order", "desc");
-      url.searchParams.set("per_page", String(GITHUB_REPO_SUGGESTION_LIMIT));
+    const results = await Promise.all(
+      queries.map(async (query) => {
+        const url = new URL(GITHUB_REPO_SEARCH_URL);
+        url.searchParams.set("q", query);
+        url.searchParams.set("sort", "stars");
+        url.searchParams.set("order", "desc");
+        url.searchParams.set("per_page", String(GITHUB_REPO_SUGGESTION_LIMIT));
 
-      const response = await fetch(url.toString(), {
-        headers: githubHeaders(),
-        signal,
-      });
-      if (!response.ok) continue;
+        const response = await fetch(url.toString(), { headers: githubHeaders(), signal });
+        if (!response.ok) return [];
 
-      const body = (await response.json()) as {
-        items?: Array<{
-          full_name?: string;
-          html_url?: string;
-          description?: string | null;
-          stargazers_count?: number;
-          name?: string;
-          owner?: { login?: string };
-        }>;
-      };
+        const body = (await response.json()) as {
+          items?: Array<{
+            full_name?: string;
+            html_url?: string;
+            description?: string | null;
+            stargazers_count?: number;
+            name?: string;
+            owner?: { login?: string };
+          }>;
+        };
 
-      for (const item of body.items || []) {
-        if (!item.full_name || !item.html_url || !item.name || !item.owner?.login) {
-          continue;
+        return (body.items || []).filter(
+          (item) => item.full_name && item.html_url && item.name && item.owner?.login,
+        );
+      }),
+    );
+
+    const candidates = new Map<string, GitHubRepoSuggestion>();
+    for (const items of results) {
+      for (const item of items) {
+        if (!candidates.has(item.full_name!)) {
+          candidates.set(item.full_name!, {
+            fullName: item.full_name!,
+            htmlUrl: item.html_url!,
+            description: item.description || undefined,
+            stars: item.stargazers_count || 0,
+            ownerLogin: item.owner!.login!,
+            name: item.name!,
+          });
         }
-        candidates.set(item.full_name, {
-          fullName: item.full_name,
-          htmlUrl: item.html_url,
-          description: item.description || undefined,
-          stars: item.stargazers_count || 0,
-          ownerLogin: item.owner.login,
-          name: item.name,
-        });
       }
     }
 
-    return Array.from(candidates.values()).slice(
-      0,
-      GITHUB_REPO_SUGGESTION_LIMIT,
-    );
+    return Array.from(candidates.values()).slice(0, GITHUB_REPO_SUGGESTION_LIMIT);
   });
 }
 
@@ -812,7 +791,7 @@ For exact keyword searches (specific function names, variable names), prefer gre
             ),
         },
 
-        async execute(args, context) {
+        async execute(args) {
           if (!MORPH_API_KEY) {
             return `Error: MORPH_API_KEY not configured.
 
@@ -928,76 +907,38 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           const repoLookup = await lookupGitHubRepository(repo);
 
           if (repoLookup.status === "not_found") {
-            const suggestions = await fetchGitHubRepoSuggestions(
-              repo,
-              args.search_term,
-            ).catch(() => []);
-            return formatPublicRepoResolutionFailure(
-              repo,
-              repoLookup.detail,
-              suggestions,
-            );
+            const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
+            return formatPublicRepoResolutionFailure(repo, repoLookup.detail, suggestions);
           }
 
           if (repoLookup.status === "unavailable") {
-            await log(
-              "warn",
-              `GitHub repo lookup unavailable for ${repo.github}: ${repoLookup.detail}`,
-            );
+            await log("warn", `GitHub repo lookup unavailable for ${repo}: ${repoLookup.detail}`);
           }
 
           try {
             const result = await warpGrep.searchGitHub({
               searchTerm: args.search_term,
-              github: repo.github,
+              github: repo,
               branch: args.branch,
             });
 
             const duration = Date.now() - startTime;
             const contextCount = result.contexts?.length ?? 0;
 
-            await log(
-              "info",
-              `Public repo context: ${repo.github} → ${contextCount} contexts (${duration}ms)`,
-            );
+            await log("info", `Public repo context: ${repo} → ${contextCount} contexts (${duration}ms)`);
 
             if (!result.success) {
-              if (isNotFoundError(result.error || "")) {
-                const suggestions = await fetchGitHubRepoSuggestions(
-                  repo,
-                  args.search_term,
-                ).catch(() => []);
-                return formatPublicRepoResolutionFailure(
-                  repo,
-                  result.error,
-                  suggestions,
-                );
-              }
-              return `Public repo context search failed for ${repo.github}: ${result.error}`;
+              const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
+              return formatPublicRepoResolutionFailure(repo, result.error, suggestions);
             }
 
-            return `Repository: ${repo.github}\n\n${formatWarpGrepResult(result)}`;
+            return `Repository: ${repo}\n\n${formatWarpGrepResult(result)}`;
           } catch (err) {
             const error = err as Error;
             const duration = Date.now() - startTime;
-            await log(
-              "error",
-              `Public repo context search failed for ${repo.github} after ${duration}ms: ${error.message}`,
-            );
-            if (isNotFoundError(error.message)) {
-              const suggestions = await fetchGitHubRepoSuggestions(
-                repo,
-                args.search_term,
-              ).catch(() => []);
-              return formatPublicRepoResolutionFailure(
-                repo,
-                error.message,
-                suggestions,
-              );
-            }
-            return `Public repo context search failed for ${repo.github}: ${error.message}
-
-Try a different repository locator, a different branch, or a more specific search term.`;
+            await log("error", `Public repo context search failed for ${repo} after ${duration}ms: ${error.message}`);
+            const suggestions = await fetchGitHubRepoSuggestions(repo, args.search_term).catch(() => []);
+            return formatPublicRepoResolutionFailure(repo, error.message, suggestions);
           }
         },
     });
