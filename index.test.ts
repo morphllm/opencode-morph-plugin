@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CompactClient } from "@morphllm/morphsdk";
 
@@ -16,6 +23,58 @@ function normalizeCodeEditInput(codeEdit: string): string {
     return lines.slice(1, -1).join("\n");
   }
   return codeEdit;
+}
+
+async function importPluginWithEnv(
+  env: Record<string, string | undefined>,
+): Promise<{
+  default: (input: any) => Promise<Record<string, any>>;
+}> {
+  const previous = new Map<string, string | undefined>();
+
+  for (const [key, value] of Object.entries(env)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+
+  try {
+    const cacheBuster = `plugin-test-${Date.now()}-${Math.random()}`;
+    return await import(`./index.ts?${cacheBuster}`);
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function makePluginInput(directory: string, worktree = directory) {
+  return {
+    client: {
+      app: {
+        log: async () => {},
+      },
+    },
+    project: {},
+    directory,
+    worktree,
+    serverUrl: new URL("http://localhost"),
+    $: {},
+  };
+}
+
+function makeToolContext(directory: string, worktree = directory) {
+  return {
+    sessionID: "session-test",
+    messageID: "message-test",
+    agent: "coder",
+    directory,
+    worktree,
+    abort: new AbortController().signal,
+    metadata: () => {},
+    ask: async () => {},
+  };
 }
 
 describe("EXISTING_CODE_MARKER", () => {
@@ -754,5 +813,84 @@ describe("feature flags", () => {
     expect(content).toContain("MORPH_EDIT");
     expect(content).toContain("MORPH_WARPGREP");
     expect(content).toContain("MORPH_COMPACT");
+  });
+});
+
+describe("plugin runtime hooks", () => {
+  test("tool.definition appends runtime notes for morph_edit", async () => {
+    const { default: MorphPlugin } = await importPluginWithEnv({
+      MORPH_API_KEY: undefined,
+      MORPH_ALLOW_READONLY_AGENTS: undefined,
+    });
+
+    const hooks = await MorphPlugin(makePluginInput("/tmp/morph-plugin"));
+    const output = {
+      description: "Base description",
+      parameters: {},
+    };
+
+    await hooks["tool.definition"]?.({ toolID: "morph_edit" }, output);
+
+    expect(output.description).toContain("Runtime notes:");
+    expect(output.description).toContain(
+      "Currently unavailable until MORPH_API_KEY is configured.",
+    );
+    expect(output.description).toContain(
+      "Blocked in readonly agents: plan, explore.",
+    );
+  });
+
+  test("system transform injects concise morph routing guidance", async () => {
+    const { default: MorphPlugin } = await importPluginWithEnv({
+      MORPH_API_KEY: "sk-test-key",
+    });
+
+    const hooks = await MorphPlugin(makePluginInput("/tmp/morph-plugin"));
+    const output = { system: [] as string[] };
+
+    await hooks["experimental.chat.system.transform"]?.(
+      {
+        sessionID: "session-test",
+        model: {},
+      },
+      output,
+    );
+
+    const combined = output.system.join("\n");
+    expect(combined).toContain("Morph plugin routing hints:");
+    expect(combined).toContain(
+      "Prefer morph_edit for large or scattered edits inside existing files.",
+    );
+    expect(combined).toContain("Use write for brand new files.");
+  });
+});
+
+describe("ToolContext path resolution", () => {
+  test("morph_edit resolves relative paths from context.directory", async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "morph-plugin-"));
+    const sessionDir = join(tempRoot, "nested");
+    mkdirSync(sessionDir, { recursive: true });
+
+    try {
+      const { default: MorphPlugin } = await importPluginWithEnv({
+        MORPH_API_KEY: "sk-test-key",
+      });
+
+      const hooks = await MorphPlugin(makePluginInput(tempRoot));
+      const result = await hooks.tool.morph_edit.execute(
+        {
+          target_filepath: "created.ts",
+          instructions: "I am creating a test file",
+          code_edit: "export const created = true;\n",
+        },
+        makeToolContext(sessionDir, tempRoot),
+      );
+
+      expect(result).toContain("Created new file: created.ts");
+      expect(existsSync(join(sessionDir, "created.ts"))).toBe(true);
+      expect(existsSync(join(tempRoot, "created.ts"))).toBe(false);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });
