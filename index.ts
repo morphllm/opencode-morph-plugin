@@ -11,6 +11,7 @@ import { type Plugin, tool } from "@opencode-ai/plugin";
 import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
+import { createHash } from "node:crypto";
 
 // Config from environment — only MORPH_API_KEY is required
 const MORPH_API_KEY = process.env.MORPH_API_KEY;
@@ -34,6 +35,10 @@ const COMPACT_PRESERVE_RECENT = parseInt(
 );
 const COMPACT_RATIO = parseFloat(
   process.env.MORPH_COMPACT_RATIO || "0.3",
+);
+const COMPACT_MIN_UNCACHED_CHARS = parseInt(
+  process.env.MORPH_COMPACT_MIN_UNCACHED_CHARS || "16000",
+  10,
 );
 
 /**
@@ -88,14 +93,16 @@ const compactClient = new CompactClient({
 });
 
 /**
- * Cache for compaction results.
- * Keyed by a hash of the message IDs that were compacted,
- * so we don't re-compact the same messages on every LLM call.
+ * Per-session compaction cache.
+ * Stores incrementally compacted prefix chunks so a growing conversation
+ * can reuse prior compaction work instead of recompacting the full old window.
  */
-let compactCache: {
-  messageIdHash: string;
+type CompactCacheChunk = {
+  messageKeys: string[];
   result: CompactResult;
-} | null = null;
+};
+
+const compactCache = new Map<string, CompactCacheChunk[]>();
 
 /**
  * Normalize code_edit input from LLM tool calls.
@@ -185,11 +192,69 @@ function estimateTotalChars(
   return total;
 }
 
-/**
- * Simple hash of message IDs for cache keying.
- */
-function hashMessageIds(messages: { info: Message }[]): string {
-  return messages.map((m) => m.info.id).join("|");
+function getMessageCacheKey(message: { info: Message; parts: Part[] }): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        id: message.info.id,
+        role: message.info.role,
+        parts: message.parts.map((part) => ({
+          type: part.type,
+          content: serializePart(part),
+        })),
+      }),
+    )
+    .digest("hex");
+}
+
+function getMessageCacheKeys(
+  messages: { info: Message; parts: Part[] }[],
+): string[] {
+  return messages.map(getMessageCacheKey);
+}
+
+function getMatchedCompactChunks(
+  cachedChunks: CompactCacheChunk[],
+  messageKeys: string[],
+): { matchedChunks: CompactCacheChunk[]; matchedMessageCount: number } {
+  const matchedChunks: CompactCacheChunk[] = [];
+  let matchedMessageCount = 0;
+
+  for (const chunk of cachedChunks) {
+    const nextCount = matchedMessageCount + chunk.messageKeys.length;
+    if (nextCount > messageKeys.length) break;
+
+    const matches = chunk.messageKeys.every(
+      (key, index) => messageKeys[matchedMessageCount + index] === key,
+    );
+    if (!matches) break;
+
+    matchedChunks.push(chunk);
+    matchedMessageCount = nextCount;
+  }
+
+  return { matchedChunks, matchedMessageCount };
+}
+
+function buildCompactedMessagesFromChunks(
+  chunks: CompactCacheChunk[],
+  sourceMessages: { info: Message; parts: Part[] }[],
+): { info: Message; parts: Part[] }[] {
+  const compactedMessages: { info: Message; parts: Part[] }[] = [];
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    compactedMessages.push(
+      buildCompactedMessage(
+        sourceMessages[offset]!,
+        chunk.result,
+        chunk.messageKeys.length,
+      ),
+    );
+    offset += chunk.messageKeys.length;
+  }
+
+  return compactedMessages;
 }
 
 /**
@@ -526,6 +591,17 @@ const MorphPlugin: Plugin = async ({ directory, client }) => {
     } catch {
       process.stderr.write(`[morph] ${message}\n`);
     }
+  };
+
+  const showToast = async (
+    variant: "info" | "success" | "warning" | "error",
+    message: string,
+  ) => {
+    try {
+      await client.tui?.showToast({
+        body: { title: "Morph Compact", message, variant, duration: 2000 },
+      });
+    } catch {}
   };
 
   if (!MORPH_API_KEY) {
@@ -1052,43 +1128,79 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       if (olderMessages.length === 0) return;
 
-      // Check cache — if we've already compacted these exact messages, reuse
-      const currentHash = hashMessageIds(olderMessages);
-      if (compactCache && compactCache.messageIdHash === currentHash) {
-        // Rebuild output from cached compaction
-        const compactedMsg = buildCompactedMessage(
-          olderMessages[0]!,
-          compactCache.result,
-          olderMessages.length,
-        );
-        output.messages = [compactedMsg, ...recentMessages];
+      const sessionID = olderMessages[0]!.info.sessionID;
+      const olderMessageKeys = getMessageCacheKeys(olderMessages);
+      const sessionCache = compactCache.get(sessionID) ?? [];
+      const { matchedChunks, matchedMessageCount } = getMatchedCompactChunks(
+        sessionCache,
+        olderMessageKeys,
+      );
+      if (matchedChunks.length !== sessionCache.length) {
+        compactCache.set(sessionID, matchedChunks);
+      }
+
+      const cachedCompactedMessages = buildCompactedMessagesFromChunks(
+        matchedChunks,
+        olderMessages,
+      );
+      const uncachedOlderMessages = olderMessages.slice(matchedMessageCount);
+
+      if (uncachedOlderMessages.length === 0) {
+        output.messages = [...cachedCompactedMessages, ...recentMessages];
         return;
       }
 
-      // Convert to compact API format and call Morph
-      const compactInput = messagesToCompactInput(olderMessages);
+      const uncachedChars = estimateTotalChars(uncachedOlderMessages);
+      if (uncachedChars < COMPACT_MIN_UNCACHED_CHARS) {
+        if (cachedCompactedMessages.length > 0) {
+          output.messages = [
+            ...cachedCompactedMessages,
+            ...uncachedOlderMessages,
+            ...recentMessages,
+          ];
+        }
+        return;
+      }
+
+      const compactInput = messagesToCompactInput(uncachedOlderMessages);
       if (compactInput.length === 0) return;
 
       try {
         const result = await compactClient.compact({
           messages: compactInput,
           compressionRatio: COMPACT_RATIO,
-          preserveRecent: 0, // we handle preservation ourselves
+          preserveRecent: 0,
         });
 
-        // Cache the result
-        compactCache = { messageIdHash: currentHash, result };
+        const newChunk: CompactCacheChunk = {
+          messageKeys: olderMessageKeys.slice(matchedMessageCount),
+          result,
+        };
+        const updatedChunks = [...matchedChunks, newChunk];
+        compactCache.set(sessionID, updatedChunks);
 
         const compactedMsg = buildCompactedMessage(
-          olderMessages[0]!,
+          uncachedOlderMessages[0]!,
           result,
-          olderMessages.length,
+          uncachedOlderMessages.length,
         );
-        output.messages = [compactedMsg, ...recentMessages];
+        output.messages = [
+          ...cachedCompactedMessages,
+          compactedMsg,
+          ...recentMessages,
+        ];
 
         await log(
           "info",
-          `Compact: ${olderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+          matchedMessageCount > 0
+            ? `Compact: ${uncachedOlderMessages.length} new messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms, ${matchedMessageCount} cached)`
+            : `Compact: ${uncachedOlderMessages.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+        );
+        await showToast(
+          "success",
+          matchedMessageCount > 0
+            ? `${uncachedOlderMessages.length} new messages compacted (${matchedMessageCount} cached) | ${result.usage.processing_time_ms}ms`
+            : `${uncachedOlderMessages.length} messages compacted (${Math.round(result.usage.compression_ratio * 100)}% kept) | ${result.usage.processing_time_ms}ms`,
         );
       } catch (err) {
         // On failure, leave messages unchanged — OpenCode's built-in compaction

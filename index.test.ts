@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CompactClient } from "@morphllm/morphsdk";
@@ -402,8 +403,51 @@ function estimateTotalChars(messages: FakeMessage[]): number {
   return total;
 }
 
-function hashMessageIds(messages: { info: { id: string } }[]): string {
-  return messages.map((m) => m.info.id).join("|");
+type FakeCompactCacheChunk = {
+  messageKeys: string[];
+  result: { output: string };
+};
+
+function getMessageCacheKey(message: FakeMessage): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        id: message.info.id,
+        role: message.info.role,
+        parts: message.parts.map((part) => ({
+          type: part.type,
+          content: serializePart(part),
+        })),
+      }),
+    )
+    .digest("hex");
+}
+
+function getMessageCacheKeys(messages: FakeMessage[]): string[] {
+  return messages.map(getMessageCacheKey);
+}
+
+function getMatchedCompactChunks(
+  cachedChunks: FakeCompactCacheChunk[],
+  messageKeys: string[],
+): { matchedChunks: FakeCompactCacheChunk[]; matchedMessageCount: number } {
+  const matchedChunks: FakeCompactCacheChunk[] = [];
+  let matchedMessageCount = 0;
+
+  for (const chunk of cachedChunks) {
+    const nextCount = matchedMessageCount + chunk.messageKeys.length;
+    if (nextCount > messageKeys.length) break;
+
+    const matches = chunk.messageKeys.every(
+      (key, index) => messageKeys[matchedMessageCount + index] === key,
+    );
+    if (!matches) break;
+
+    matchedChunks.push(chunk);
+    matchedMessageCount = nextCount;
+  }
+
+  return { matchedChunks, matchedMessageCount };
 }
 
 // Helpers to build fake messages for tests
@@ -611,22 +655,63 @@ describe("estimateTotalChars", () => {
   });
 });
 
-describe("hashMessageIds", () => {
-  test("joins message IDs with pipe", () => {
+describe("getMessageCacheKey", () => {
+  test("is stable for the same message", () => {
+    const message = makeTextMsg("abc", "user", "hello");
+    expect(getMessageCacheKey(message)).toBe(getMessageCacheKey(message));
+  });
+
+  test("changes when message role changes", () => {
+    const userMessage = makeTextMsg("abc", "user", "hello");
+    const assistantMessage = makeTextMsg("abc", "assistant", "hello");
+    expect(getMessageCacheKey(userMessage)).not.toBe(
+      getMessageCacheKey(assistantMessage),
+    );
+  });
+
+  test("changes when serialized content changes", () => {
+    const first = makeToolMsg("tool-1", "read", { path: "/a" }, "one");
+    const second = makeToolMsg("tool-1", "read", { path: "/a" }, "two");
+    expect(getMessageCacheKey(first)).not.toBe(getMessageCacheKey(second));
+  });
+});
+
+describe("getMatchedCompactChunks", () => {
+  test("matches cached prefix chunks in order", () => {
     const messages = [
-      { info: { id: "abc" } },
-      { info: { id: "def" } },
-      { info: { id: "ghi" } },
+      makeTextMsg("1", "user", "a"),
+      makeTextMsg("2", "assistant", "b"),
+      makeTextMsg("3", "user", "c"),
+      makeTextMsg("4", "assistant", "d"),
     ];
-    expect(hashMessageIds(messages)).toBe("abc|def|ghi");
+    const keys = getMessageCacheKeys(messages);
+    const cachedChunks: FakeCompactCacheChunk[] = [
+      { messageKeys: keys.slice(0, 2), result: { output: "chunk-1" } },
+      { messageKeys: keys.slice(2, 3), result: { output: "chunk-2" } },
+    ];
+
+    expect(getMatchedCompactChunks(cachedChunks, keys)).toEqual({
+      matchedChunks: cachedChunks,
+      matchedMessageCount: 3,
+    });
   });
 
-  test("returns empty string for empty array", () => {
-    expect(hashMessageIds([])).toBe("");
-  });
+  test("stops matching when the prefix diverges", () => {
+    const messages = [
+      makeTextMsg("1", "user", "a"),
+      makeTextMsg("2", "assistant", "b"),
+      makeTextMsg("3", "user", "c"),
+    ];
+    const keys = getMessageCacheKeys(messages);
+    const cachedChunks: FakeCompactCacheChunk[] = [
+      { messageKeys: keys.slice(0, 2), result: { output: "chunk-1" } },
+      { messageKeys: ["wrong-key"], result: { output: "chunk-2" } },
+    ];
 
-  test("handles single message", () => {
-    expect(hashMessageIds([{ info: { id: "only" } }])).toBe("only");
+    expect(getMatchedCompactChunks(cachedChunks, keys)).toEqual({
+      matchedChunks: [cachedChunks[0]!],
+      matchedMessageCount: 2,
+    });
   });
 });
 
@@ -690,7 +775,7 @@ describe("compaction integration", () => {
 
   test("proactive compaction threshold logic", () => {
     // Simulate the decision flow from experimental.chat.messages.transform
-    const THRESHOLD = 140000;
+    const THRESHOLD = 100000;
     const PRESERVE_RECENT = 6;
 
     // Below threshold — no compaction
@@ -720,17 +805,35 @@ describe("compaction integration", () => {
     expect(compactInput.length).toBe(14);
     expect(compactInput.every((m) => m.content.length > 0)).toBe(true);
 
-    // Hash is stable
-    const hash1 = hashMessageIds(older);
-    const hash2 = hashMessageIds(older);
-    expect(hash1).toBe(hash2);
+    const olderKeys = getMessageCacheKeys(older);
+    expect(olderKeys).toHaveLength(14);
+    expect(olderKeys[0]).toHaveLength(64);
+  });
 
-    // Hash changes when messages change
-    const differentOlder = [
-      ...older.slice(0, -1),
-      makeTextMsg("new-id", "user", "different"),
+  test("prefix reuse leaves small uncached deltas un-compacted", () => {
+    const PRESERVE_RECENT = 6;
+    const older = [
+      makeTextMsg("1", "user", "x".repeat(35000)),
+      makeTextMsg("2", "assistant", "x".repeat(35000)),
+      makeTextMsg("3", "user", "x".repeat(35000)),
+      makeTextMsg("4", "assistant", "x".repeat(4000)),
     ];
-    expect(hashMessageIds(differentOlder)).not.toBe(hash1);
+    const recent = Array.from({ length: PRESERVE_RECENT }, (_, i) =>
+      makeTextMsg(`recent-${i}`, i % 2 === 0 ? "user" : "assistant", "recent"),
+    );
+    const messages = [...older, ...recent];
+    const olderKeys = getMessageCacheKeys(older);
+    const cachedChunks: FakeCompactCacheChunk[] = [
+      { messageKeys: olderKeys.slice(0, 3), result: { output: "cached-prefix" } },
+    ];
+
+    const { matchedMessageCount } = getMatchedCompactChunks(cachedChunks, olderKeys);
+    const uncachedOlderMessages = older.slice(matchedMessageCount);
+
+    expect(estimateTotalChars(messages)).toBeGreaterThan(100000);
+    expect(estimateTotalChars(uncachedOlderMessages)).toBeLessThan(16000);
+    expect(matchedMessageCount).toBe(3);
+    expect(uncachedOlderMessages).toHaveLength(1);
   });
 
   test("too few messages does not trigger compaction", () => {
