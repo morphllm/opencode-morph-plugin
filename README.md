@@ -81,10 +81,10 @@ Then reference it in your `opencode.json`:
   }                                  }
   // ... existing code ...           export default validateToken;
 
-  ┌──────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐
+  ┌───────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐
   │ code_edit │───>│ Morph API │───>│ safety   │───>│ write to │
-  │ + file   │    │ merge     │    │ guards   │    │ disk     │
-  └──────────┘    └───────────┘    └──────────┘    └──────────┘
+  │ + file    │    │ merge     │    │ guards   │    │ disk     │
+  └───────────┘    └───────────┘    └──────────┘    └──────────┘
                                     marker leak?
                                     truncation?
 ```
@@ -137,18 +137,18 @@ If the repo locator is wrong, the tool now returns a resolver-style failure with
 
 ## State-of-the-Art Compaction
 
-25,000+ tok/s context compression in under 2 seconds. +0.6% on SWE-Bench Pro, where summarization-based compaction methods all hurt performance. Fires at 140k chars (~35k tokens), before OpenCode's built-in auto-compact (95% context window). Results cached per message set.
+25,000+ tok/s context compression in under 2 seconds. +0.6% on SWE-Bench Pro, where summarization-based compaction methods all hurt performance. Fires at 100k chars (roughly ~25k tokens, depending on content), before OpenCode's built-in auto-compact (95% context window). Results cached per message set.
 
 ```
   Every LLM call                      Only fires when context is large
 
   ┌───────────────────────────────────────────────────┐
-  │              Message History (20 msgs)             │
+  │              Message History (20 msgs)            │
   │  msg1  msg2  msg3  ...  msg14 │ msg15 ... msg20   │
   │  ──────── older ─────────────   ── recent (6) ──  │
   └───────────────────────────────────────────────────┘
                     │                       │
-        total > 140k chars?                  │
+        total > 100k chars?                 │
                     │                       │
                     v                       │
           ┌─────────────────┐               │
@@ -191,7 +191,7 @@ If the repo locator is wrong, the tool now returns a resolver-style failure with
 | `MORPH_WARPGREP` | `true` | Set `false` to disable WarpGrep |
 | `MORPH_WARPGREP_GITHUB` | `true` | Set `false` to disable public repo context search |
 | `MORPH_COMPACT` | `true` | Set `false` to disable compaction |
-| `MORPH_COMPACT_CHAR_THRESHOLD` | `140000` | Char count before compaction triggers |
+| `MORPH_COMPACT_CHAR_THRESHOLD` | `100000` | Char count before compaction triggers |
 | `MORPH_COMPACT_RATIO` | `0.3` | Compression ratio (0.05-1.0, lower = more aggressive) |
 
 ---
