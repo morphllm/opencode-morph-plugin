@@ -12,6 +12,7 @@ import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import { createHash } from "node:crypto";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 
 // Config from environment — only MORPH_API_KEY is required
 const MORPH_API_KEY = process.env.MORPH_API_KEY;
@@ -64,33 +65,40 @@ const PLUGIN_VERSION = "2.0.0";
 
 /** Canonical marker string used for lazy edit placeholders */
 const EXISTING_CODE_MARKER = "// ... existing code ...";
+const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
 
 /**
  * Shared MorphClient — FastApply uses morph.fastApply.applyEdit()
  * with MORPH_API_URL passed as per-call override.
  */
-const morph = new MorphClient({
-  apiKey: MORPH_API_KEY,
-  timeout: MORPH_TIMEOUT,
-});
+const morph = MORPH_API_KEY
+  ? new MorphClient({
+      apiKey: MORPH_API_KEY,
+      timeout: MORPH_TIMEOUT,
+    })
+  : null;
 
 /**
  * Separate WarpGrep client with its own timeout (typically longer than fast apply).
  */
-const warpGrep = new WarpGrepClient({
-  morphApiKey: MORPH_API_KEY,
-  morphApiUrl: MORPH_API_URL,
-  timeout: MORPH_WARP_GREP_TIMEOUT,
-});
+const warpGrep = MORPH_API_KEY
+  ? new WarpGrepClient({
+      morphApiKey: MORPH_API_KEY,
+      morphApiUrl: MORPH_API_URL,
+      timeout: MORPH_WARP_GREP_TIMEOUT,
+    })
+  : null;
 
 /**
  * Separate CompactClient for context compaction.
  */
-const compactClient = new CompactClient({
-  morphApiKey: MORPH_API_KEY,
-  morphApiUrl: MORPH_API_URL,
-  timeout: MORPH_COMPACT_TIMEOUT,
-});
+const compactClient = MORPH_API_KEY
+  ? new CompactClient({
+      morphApiKey: MORPH_API_KEY,
+      morphApiUrl: MORPH_API_URL,
+      timeout: MORPH_COMPACT_TIMEOUT,
+    })
+  : null;
 
 /**
  * Per-session compaction cache.
@@ -255,6 +263,117 @@ function buildCompactedMessagesFromChunks(
   }
 
   return compactedMessages;
+}
+
+function resolveSessionFilepath(
+  targetFilepath: string,
+  sessionDirectory: string,
+): string {
+  return isAbsolute(targetFilepath)
+    ? targetFilepath
+    : resolvePath(sessionDirectory, targetFilepath);
+}
+
+function resolveSessionRepoRoot(
+  sessionDirectory: string,
+  sessionWorktree: string,
+): string {
+  return sessionWorktree || sessionDirectory;
+}
+
+function appendRuntimeNotes(description: string, notes: string[]): string {
+  if (notes.length === 0) return description;
+
+  return `${description}\n\nRuntime notes:\n${notes.map((note) => `- ${note}`).join("\n")}`;
+}
+
+function buildToolRuntimeNotes(toolID: string): string[] {
+  switch (toolID) {
+    case "morph_edit": {
+      const notes = [
+        "Relative paths resolve from the active session directory.",
+      ];
+
+      if (!ALLOW_READONLY_AGENTS) {
+        notes.push(
+          `Blocked in readonly agents: ${READONLY_AGENTS.join(", ")}.`,
+        );
+      }
+
+      if (!MORPH_API_KEY) {
+        notes.push("Currently unavailable until MORPH_API_KEY is configured.");
+      }
+
+      return notes;
+    }
+
+    case "warpgrep_codebase_search": {
+      const notes = [
+        "Searches the current project worktree, not just the immediate cwd.",
+      ];
+
+      if (!MORPH_API_KEY) {
+        notes.push("Currently unavailable until MORPH_API_KEY is configured.");
+      }
+
+      return notes;
+    }
+
+    case "warpgrep_github_search": {
+      const notes = [
+        "Use this for public GitHub source questions, not the current checked-out repo.",
+      ];
+
+      if (!MORPH_API_KEY) {
+        notes.push("Currently unavailable until MORPH_API_KEY is configured.");
+      }
+
+      return notes;
+    }
+
+    default:
+      return [];
+  }
+}
+
+function buildMorphSystemRoutingHint(): string | null {
+  if (!MORPH_API_KEY) {
+    return [
+      MORPH_ROUTING_HINT_HEADER,
+      "- Morph remote tools are currently unavailable because MORPH_API_KEY is not configured.",
+      "- Use native edit/write/grep tools until Morph credentials are configured.",
+    ].join("\n");
+  }
+
+  const lines = [MORPH_ROUTING_HINT_HEADER];
+
+  if (MORPH_EDIT_ENABLED) {
+    lines.push(
+      "- Prefer morph_edit for large or scattered edits inside existing files.",
+    );
+    lines.push("- Use native edit for small exact replacements.");
+    lines.push("- Use write for brand new files.");
+
+    if (!ALLOW_READONLY_AGENTS) {
+      lines.push(
+        `- morph_edit is blocked in readonly agents: ${READONLY_AGENTS.join(", ")}.`,
+      );
+    }
+  }
+
+  if (MORPH_WARPGREP_ENABLED) {
+    lines.push(
+      "- Use warpgrep_codebase_search for exploratory local codebase questions.",
+    );
+  }
+
+  if (MORPH_WARPGREP_GITHUB_ENABLED) {
+    lines.push(
+      "- Use warpgrep_github_search for public GitHub source questions.",
+    );
+  }
+
+  return lines.length > 1 ? lines.join("\n") : null;
 }
 
 /**
@@ -691,9 +810,10 @@ Options:
 3. Set MORPH_ALLOW_READONLY_AGENTS=true to override this restriction`;
           }
 
-          const filepath = target_filepath.startsWith("/")
-            ? target_filepath
-            : `${directory}/${target_filepath}`;
+          const filepath = resolveSessionFilepath(
+            target_filepath,
+            context.directory,
+          );
 
           if (!MORPH_API_KEY) {
             return `Error: MORPH_API_KEY not configured.
@@ -751,7 +871,7 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
 
           // Call Morph SDK to merge the edit
           const startTime = Date.now();
-          const result = await morph.fastApply.applyEdit(
+          const result = await morph!.fastApply.applyEdit(
             {
               originalCode,
               codeEdit: normalizedCodeEdit,
@@ -866,7 +986,7 @@ For exact keyword searches (specific function names, variable names), prefer gre
             ),
         },
 
-        async execute(args) {
+        async execute(args, context) {
           if (!MORPH_API_KEY) {
             return `Error: MORPH_API_KEY not configured.
 
@@ -877,9 +997,12 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           const startTime = Date.now();
 
           try {
-            const generator = warpGrep.execute({
+            const generator = warpGrep!.execute({
               searchTerm: args.search_term,
-              repoRoot: directory,
+              repoRoot: resolveSessionRepoRoot(
+                context.directory,
+                context.worktree,
+              ),
               streamSteps: true,
             });
 
@@ -994,7 +1117,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           }
 
           try {
-            const result = await warpGrep.searchGitHub({
+            const result = await warpGrep!.searchGitHub({
               searchTerm: args.search_term,
               github: repo,
               branch: args.branch,
@@ -1026,6 +1149,28 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
   const hooks: Record<string, any> = {
     tool: tools,
   };
+
+  hooks["tool.definition"] = async (input: any, output: any) => {
+    const notes = buildToolRuntimeNotes(input.toolID);
+    if (notes.length === 0) return;
+
+    output.description = appendRuntimeNotes(output.description, notes);
+  };
+
+  const systemRoutingHint = buildMorphSystemRoutingHint();
+  if (systemRoutingHint) {
+    hooks["experimental.chat.system.transform"] = async (
+      _input: any,
+      output: any,
+    ) => {
+      const alreadyPresent = output.system.some((entry: string) =>
+        entry.includes(MORPH_ROUTING_HINT_HEADER),
+      );
+      if (!alreadyPresent) {
+        output.system.push(systemRoutingHint);
+      }
+    };
+  }
 
   // Customize tool output display in TUI
   hooks["tool.execute.after"] = async (input: any, output: any) => {
@@ -1166,7 +1311,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       if (compactInput.length === 0) return;
 
       try {
-        const result = await compactClient.compact({
+        const result = await compactClient!.compact({
           messages: compactInput,
           compressionRatio: COMPACT_RATIO,
           preserveRecent: 0,
