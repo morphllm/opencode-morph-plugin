@@ -2,11 +2,11 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 jobs:
-  release:
-    name: Create Release
+  publish:
+    name: Build & Publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -35,33 +35,37 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Check if version changed
+        id: version
+        run: |
+          LOCAL=$(node -p "require('./package.json').version")
+          REMOTE=$(npm view @morphllm/opencode-morph-plugin version 2>/dev/null || echo "0.0.0")
+          echo "local=$LOCAL" >> "$GITHUB_OUTPUT"
+          echo "remote=$REMOTE" >> "$GITHUB_OUTPUT"
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm
+        if: steps.version.outputs.changed == 'true'
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Extract changelog
-        id: changelog
+      - name: Create GitHub Release
+        if: steps.version.outputs.changed == 'true'
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          # Extract the section for this version from CHANGELOG.md
-          NOTES=$(awk "/^## \[${VERSION}\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)
-          # Write to file for gh release
+          VERSION="v${{ steps.version.outputs.local }}"
+          NOTES=$(awk "/^## \[${VERSION#v}\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)
           NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
           echo "$NOTES" > "$NOTES_FILE"
 
-      - name: Create GitHub Release
-        run: |
-          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
-
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" \
-              --title "$GITHUB_REF_NAME" \
-              --notes-file "$NOTES_FILE"
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release edit "$VERSION" --title "$VERSION" --notes-file "$NOTES_FILE"
           else
-            gh release create "$GITHUB_REF_NAME" \
-              --title "$GITHUB_REF_NAME" \
-              --notes-file "$NOTES_FILE"
+            gh release create "$VERSION" --title "$VERSION" --notes-file "$NOTES_FILE"
           fi
         env:
           GH_TOKEN: ${{ github.token }}
