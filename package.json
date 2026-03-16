@@ -1,6 +1,6 @@
 {
   "name": "@morphllm/opencode-morph-plugin",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "OpenCode plugin for Morph SDK - fast apply, WarpGrep codebase search",
   "type": "module",
   "main": "dist/index.js",
