@@ -33,14 +33,21 @@ const COMPACT_CONTEXT_THRESHOLD = parseFloat(
   process.env.MORPH_COMPACT_CONTEXT_THRESHOLD || "0.7",
 );
 
-// Number of recent messages to keep uncompacted (full fidelity for the LLM)
+// Number of recent messages to keep uncompacted (full fidelity for the LLM).
+// Default 1 = keep only the latest user prompt; compact all prior messages.
 const COMPACT_PRESERVE_RECENT = parseInt(
-  process.env.MORPH_COMPACT_PRESERVE_RECENT || "6",
+  process.env.MORPH_COMPACT_PRESERVE_RECENT || "1",
   10,
 );
 const COMPACT_RATIO = parseFloat(
   process.env.MORPH_COMPACT_RATIO || "0.3",
 );
+
+// Optional fixed token limit — overrides the percentage-based threshold.
+// e.g. MORPH_COMPACT_TOKEN_LIMIT=20000 → compact at 20k tokens regardless of model window
+const COMPACT_TOKEN_LIMIT = process.env.MORPH_COMPACT_TOKEN_LIMIT
+  ? parseInt(process.env.MORPH_COMPACT_TOKEN_LIMIT, 10)
+  : null;
 
 /**
  * Feature flags — users can disable specific capabilities.
@@ -1201,6 +1208,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
   if (MORPH_COMPACT_ENABLED) {
     // Capture model context window from chat.params (fires every LLM call)
     hooks["chat.params"] = async (input: any) => {
+      // debugLog(`chat.params CALLED: model=${input.model?.id}, context=${input.model?.limit?.context}`);
       if (input.model?.limit?.context) {
         modelContextTokens = input.model.limit.context;
       }
@@ -1211,13 +1219,29 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
     // preserving the LLM provider's prompt prefix cache.
     // Re-compaction only fires when the threshold is crossed again.
     hooks["experimental.chat.messages.transform"] = async (_input: any, output: any) => {
+      //
       if (!MORPH_API_KEY) return;
 
       const messages = output.messages;
-      if (messages.length < COMPACT_PRESERVE_RECENT + 2) return;
 
-      // Approximate char threshold from model context window
-      const charThreshold = modelContextTokens * COMPACT_CONTEXT_THRESHOLD * CHARS_PER_TOKEN;
+      // Approximate char threshold — fixed token limit takes precedence
+      const charThreshold = COMPACT_TOKEN_LIMIT
+        ? COMPACT_TOKEN_LIMIT * CHARS_PER_TOKEN
+        : modelContextTokens * COMPACT_CONTEXT_THRESHOLD * CHARS_PER_TOKEN;
+
+      const totalChars = estimateTotalChars(messages);
+      const estTokens = Math.round(totalChars / CHARS_PER_TOKEN);
+
+      await log(
+        "debug",
+        `messages.transform: ${messages.length} msgs, ${totalChars} chars (~${estTokens} tokens), threshold=${charThreshold} chars (~${Math.round(charThreshold / CHARS_PER_TOKEN)} tokens), hasFrozen=${!!compactionState}, tokenLimit=${COMPACT_TOKEN_LIMIT ?? "auto"}, modelCtx=${modelContextTokens}`,
+      );
+
+      // Need at least preserve + 1 messages (something to compact + preserved recent)
+      if (messages.length <= COMPACT_PRESERVE_RECENT) {
+        // debugLog(`Skipping compact: only ${messages.length} messages (need > ${COMPACT_PRESERVE_RECENT})`);
+        return;
+      }
 
       if (compactionState) {
         // We have a frozen block from a previous compaction.
@@ -1225,21 +1249,36 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         const uncompacted = messages.slice(compactionState.compactedUpToIndex);
         const effectiveChars = compactionState.frozenChars + estimateTotalChars(uncompacted);
 
+        await log(
+          "debug",
+          `Re-compact check: frozenChars=${compactionState.frozenChars}, uncompacted=${uncompacted.length} msgs (${estimateTotalChars(uncompacted)} chars), effective=${effectiveChars}, threshold=${charThreshold}`,
+        );
+
         if (effectiveChars < charThreshold) {
           // Under threshold — reuse frozen block as-is (stable prefix = cache hit)
+          const before = messages.length;
           output.messages = [...compactionState.frozenMessages, ...uncompacted];
+          await log(
+            "debug",
+            `Under threshold — reusing frozen block. Messages: ${before} → ${output.messages.length}`,
+          );
           return;
         }
 
         // Over threshold again — discard old frozen block, compact only the
         // uncompacted messages (never double-compact).
-        if (uncompacted.length <= COMPACT_PRESERVE_RECENT) return;
+        if (uncompacted.length <= COMPACT_PRESERVE_RECENT) {
+          await log("debug", `Cannot re-compact: only ${uncompacted.length} uncompacted messages (need > ${COMPACT_PRESERVE_RECENT})`);
+          return;
+        }
 
         const toCompact = uncompacted.slice(0, -COMPACT_PRESERVE_RECENT);
         const recent = uncompacted.slice(-COMPACT_PRESERVE_RECENT);
 
         const compactInput = messagesToCompactInput(toCompact);
         if (compactInput.length === 0) return;
+
+        await log("info", `Re-compacting ${toCompact.length} messages (${estimateTotalChars(toCompact)} chars), keeping ${recent.length} recent...`);
 
         try {
           const result = await compactClient!.compact({
@@ -1249,16 +1288,18 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           });
 
           const frozen = buildCompactedMessages(toCompact, result);
+          const frozenChars = estimateTotalChars(frozen);
           compactionState = {
             frozenMessages: frozen,
             compactedUpToIndex: messages.length - recent.length,
-            frozenChars: estimateTotalChars(frozen),
+            frozenChars,
           };
+          const beforeLen = messages.length;
           output.messages = [...frozen, ...recent];
 
           await log(
             "info",
-            `Compact (re): ${toCompact.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms). Old frozen block discarded.`,
+            `Compact (re): ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
           );
           await showToast(
             "success",
@@ -1276,41 +1317,57 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       }
 
       // No frozen block yet — check if first compaction is needed
-      const totalChars = estimateTotalChars(messages);
-      if (totalChars < charThreshold) return;
+      // debugLog(`First compact check: totalChars=${totalChars}, charThreshold=${charThreshold}, over=${totalChars >= charThreshold}`);
+      if (totalChars < charThreshold) {
+        // debugLog(`Under threshold (${totalChars} < ${charThreshold}), skipping`);
+        return;
+      }
 
       const toCompact = messages.slice(0, -COMPACT_PRESERVE_RECENT);
       const recent = messages.slice(-COMPACT_PRESERVE_RECENT);
 
-      if (toCompact.length === 0) return;
+      // debugLog(`First compact: toCompact=${toCompact.length} msgs (${estimateTotalChars(toCompact)} chars), recent=${recent.length} msgs`);
+      if (toCompact.length === 0) {
+        // debugLog(`Nothing to compact (toCompact empty)`);
+        return;
+      }
 
       const compactInput = messagesToCompactInput(toCompact);
+      // debugLog(`compactInput: ${compactInput.length} messages, total chars=${compactInput.reduce((a, m) => a + m.content.length, 0)}`);
       if (compactInput.length === 0) return;
 
+      await log("info", `First compaction: ${toCompact.length} messages (${estimateTotalChars(toCompact)} chars), keeping ${recent.length} recent. Threshold crossed: ${totalChars} >= ${charThreshold}`);
+
       try {
+        // debugLog(`Calling compactClient.compact() with ${compactInput.length} messages, ratio=${COMPACT_RATIO}...`);
         const result = await compactClient!.compact({
           messages: compactInput,
           compressionRatio: COMPACT_RATIO,
           preserveRecent: 0,
         });
+        // debugLog(`compactClient.compact() returned: ratio=${result.usage?.compression_ratio}, time=${result.usage?.processing_time_ms}ms, resultMsgs=${result.messages?.length}`);
 
         const frozen = buildCompactedMessages(toCompact, result);
+        const frozenChars = estimateTotalChars(frozen);
         compactionState = {
           frozenMessages: frozen,
           compactedUpToIndex: messages.length - recent.length,
-          frozenChars: estimateTotalChars(frozen),
+          frozenChars,
         };
+        const beforeLen = messages.length;
         output.messages = [...frozen, ...recent];
 
+        // debugLog(`Compact done: ${toCompact.length} msgs → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}`);
         await log(
           "info",
-          `Compact: ${toCompact.length} messages → ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+          `Compact: ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
         );
         await showToast(
           "success",
           `${toCompact.length} messages compacted (${Math.round(result.usage.compression_ratio * 100)}% kept) | ${result.usage.processing_time_ms}ms`,
         );
       } catch (err) {
+        // debugLog(`Compact FAILED: ${(err as Error).message}\n${(err as Error).stack}`);
         await log(
           "warn",
           `Compact failed: ${(err as Error).message}. Falling back to native compaction.`,
