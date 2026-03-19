@@ -1208,7 +1208,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
   if (MORPH_COMPACT_ENABLED) {
     // Capture model context window from chat.params (fires every LLM call)
     hooks["chat.params"] = async (input: any) => {
-      // debugLog(`chat.params CALLED: model=${input.model?.id}, context=${input.model?.limit?.context}`);
+      //chat.params CALLED: model=${input.model?.id}, context=${input.model?.limit?.context}`);
       if (input.model?.limit?.context) {
         modelContextTokens = input.model.limit.context;
       }
@@ -1219,7 +1219,6 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
     // preserving the LLM provider's prompt prefix cache.
     // Re-compaction only fires when the threshold is crossed again.
     hooks["experimental.chat.messages.transform"] = async (_input: any, output: any) => {
-      //
       if (!MORPH_API_KEY) return;
 
       const messages = output.messages;
@@ -1239,7 +1238,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       // Need at least preserve + 1 messages (something to compact + preserved recent)
       if (messages.length <= COMPACT_PRESERVE_RECENT) {
-        // debugLog(`Skipping compact: only ${messages.length} messages (need > ${COMPACT_PRESERVE_RECENT})`);
+        //Skipping compact: only ${messages.length} messages (need > ${COMPACT_PRESERVE_RECENT})`);
         return;
       }
 
@@ -1317,35 +1316,35 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       }
 
       // No frozen block yet — check if first compaction is needed
-      // debugLog(`First compact check: totalChars=${totalChars}, charThreshold=${charThreshold}, over=${totalChars >= charThreshold}`);
+      //First compact check: totalChars=${totalChars}, charThreshold=${charThreshold}, over=${totalChars >= charThreshold}`);
       if (totalChars < charThreshold) {
-        // debugLog(`Under threshold (${totalChars} < ${charThreshold}), skipping`);
+        //Under threshold (${totalChars} < ${charThreshold}), skipping`);
         return;
       }
 
       const toCompact = messages.slice(0, -COMPACT_PRESERVE_RECENT);
       const recent = messages.slice(-COMPACT_PRESERVE_RECENT);
 
-      // debugLog(`First compact: toCompact=${toCompact.length} msgs (${estimateTotalChars(toCompact)} chars), recent=${recent.length} msgs`);
+      //First compact: toCompact=${toCompact.length} msgs (${estimateTotalChars(toCompact)} chars), recent=${recent.length} msgs`);
       if (toCompact.length === 0) {
-        // debugLog(`Nothing to compact (toCompact empty)`);
+        //Nothing to compact (toCompact empty)`);
         return;
       }
 
       const compactInput = messagesToCompactInput(toCompact);
-      // debugLog(`compactInput: ${compactInput.length} messages, total chars=${compactInput.reduce((a, m) => a + m.content.length, 0)}`);
+      //compactInput: ${compactInput.length} messages, total chars=${compactInput.reduce((a, m) => a + m.content.length, 0)}`);
       if (compactInput.length === 0) return;
 
       await log("info", `First compaction: ${toCompact.length} messages (${estimateTotalChars(toCompact)} chars), keeping ${recent.length} recent. Threshold crossed: ${totalChars} >= ${charThreshold}`);
 
       try {
-        // debugLog(`Calling compactClient.compact() with ${compactInput.length} messages, ratio=${COMPACT_RATIO}...`);
+        //Calling compactClient.compact() with ${compactInput.length} messages, ratio=${COMPACT_RATIO}...`);
         const result = await compactClient!.compact({
           messages: compactInput,
           compressionRatio: COMPACT_RATIO,
           preserveRecent: 0,
         });
-        // debugLog(`compactClient.compact() returned: ratio=${result.usage?.compression_ratio}, time=${result.usage?.processing_time_ms}ms, resultMsgs=${result.messages?.length}`);
+        //compactClient.compact() returned: ratio=${result.usage?.compression_ratio}, time=${result.usage?.processing_time_ms}ms, resultMsgs=${result.messages?.length}`);
 
         const frozen = buildCompactedMessages(toCompact, result);
         const frozenChars = estimateTotalChars(frozen);
@@ -1357,7 +1356,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         const beforeLen = messages.length;
         output.messages = [...frozen, ...recent];
 
-        // debugLog(`Compact done: ${toCompact.length} msgs → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}`);
+        //Compact done: ${toCompact.length} msgs → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}`);
         await log(
           "info",
           `Compact: ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
@@ -1367,7 +1366,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           `${toCompact.length} messages compacted (${Math.round(result.usage.compression_ratio * 100)}% kept) | ${result.usage.processing_time_ms}ms`,
         );
       } catch (err) {
-        // debugLog(`Compact FAILED: ${(err as Error).message}\n${(err as Error).stack}`);
+        //Compact FAILED: ${(err as Error).message}\n${(err as Error).stack}`);
         await log(
           "warn",
           `Compact failed: ${(err as Error).message}. Falling back to native compaction.`,

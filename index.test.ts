@@ -109,15 +109,12 @@ describe("packaged tool-selection instructions", () => {
   test("README documents plugin setup and tools", () => {
     const content = readFileSync(join(import.meta.dir, "README.md"), "utf-8");
 
-    expect(content).toContain(
-      "~/.config/opencode/instructions/morph-tools.md",
-    );
     expect(content).toContain("morph_edit");
     expect(content).toContain("warpgrep_codebase_search");
     expect(content).toContain("warpgrep_github_search");
     expect(content).toContain("MORPH_API_KEY");
-    expect(content).toContain("MORPH_WARPGREP_GITHUB");
-    expect(content).toContain("Safety guards");
+    expect(content).toContain("MORPH_COMPACT_TOKEN_LIMIT");
+    expect(content).toContain("opencode.json");
   });
 });
 

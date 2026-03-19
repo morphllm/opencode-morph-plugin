@@ -15,26 +15,28 @@ On production repos and SWE-Bench Pro, enabling WarpGrep and compaction improves
 
 ---
 
-## Setup
+## Quick Start
 
-### 1. Get an API key
+### 1. Get a Morph API key
 
-Sign up at [morphllm.com/dashboard](https://morphllm.com/dashboard/api-keys) and add it to your environment:
+Sign up at [morphllm.com/dashboard](https://morphllm.com/dashboard/api-keys) and export it:
 
 ```bash
 export MORPH_API_KEY="sk-..."
 ```
 
-### 2. Install the plugin
+Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) so it persists.
 
-Recommended: install it as an npm package in your OpenCode config directory.
+### 2. Install the plugin
 
 ```bash
 cd ~/.config/opencode
 npm i @morphllm/opencode-morph-plugin
 ```
 
-Then register it in `~/.config/opencode/opencode.json`:
+### 3. Register in opencode.json
+
+Edit `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -46,155 +48,102 @@ Then register it in `~/.config/opencode/opencode.json`:
 }
 ```
 
-This follows OpenCode's recommended npm plugin flow: declare the plugin in `opencode.json`, and let OpenCode load it from your installed dependencies.
-
-### 3. Add tool routing instructions (recommended)
-
-If you prefer to manage instructions separately, copy the packaged routing policy from the installed npm package so the LLM picks the right tool:
+### 4. Start OpenCode
 
 ```bash
-cp node_modules/@morphllm/opencode-morph-plugin/instructions/morph-tools.md ~/.config/opencode/instructions/
+opencode
 ```
 
-Then reference it in your `opencode.json`:
+You should see `morph_edit`, `warpgrep_codebase_search`, and `warpgrep_github_search` in the available tools. Compaction runs automatically in the background.
 
-```json
-{
-  "instructions": ["~/.config/opencode/instructions/morph-tools.md"]
-}
+---
+
+## Compaction
+
+Context compression via the Morph Compact API. Runs automatically before each LLM call when the conversation exceeds a token threshold.
+
+### How it works
+
+1. Before each LLM call, the plugin estimates the total characters in the conversation
+2. If the estimate exceeds the threshold, older messages are compressed via the Morph Compact API (~250ms)
+3. The compressed result is cached ("frozen") and reused on subsequent calls for prompt cache stability
+4. Only the most recent user message is kept uncompacted
+
+The LLM receives compressed history + your latest prompt. The "Context: X tokens" number in the sidebar reflects the actual tokens sent (post-compaction).
+
+### Configuring the compaction threshold
+
+By default, compaction triggers at **70% of the model's context window**. You can override this with a fixed token limit:
+
+```bash
+# Compact when conversation exceeds 20,000 tokens
+export MORPH_COMPACT_TOKEN_LIMIT=20000
+```
+
+For aggressive compaction during testing:
+
+```bash
+export MORPH_COMPACT_TOKEN_LIMIT=5000
+```
+
+### Verifying compaction is working
+
+Check the OpenCode log files in `~/.local/share/opencode/log/`. Look for entries with `service=morph`:
+
+```bash
+grep "service=morph" ~/.local/share/opencode/log/*.log | grep -i compact
+```
+
+When compaction fires, you'll see entries like:
+
+```
+INFO service=morph First compaction: 2 messages (30137 chars), keeping 1 recent. Threshold crossed: 30178 >= 15000
+INFO service=morph Compact: 2 messages -> 2 frozen (15142 chars). Messages: 3 -> 3. Ratio: 45% kept (244ms)
+```
+
+You'll also see a toast notification in the OpenCode UI when compaction triggers.
+
+On subsequent LLM calls (before re-compaction is needed), you'll see:
+
+```
+INFO service=morph Under threshold - reusing frozen block. Messages: 5 -> 5
 ```
 
 ---
 
-## Fast Apply (`morph_edit`)
+## Tools
 
-10,500+ tok/s code merging. The LLM writes partial snippets with lazy markers, Morph merges them into the full file.
+### Fast Apply (`morph_edit`)
 
-```
-  LLM generates partial edit         Morph merges into full file
-  with lazy markers                  at 10,500+ tok/s
+10,500+ tok/s code merging. The LLM writes partial snippets with lazy markers (`// ... existing code ...`), Morph merges them into the full file.
 
-  // ... existing code ...           function validateToken(token) {
-  function validateToken(token) {      const decoded = jwt.verify(token);
-    if (!token) {             ──>      if (!token) {
-      throw new Error("...");            throw new Error("...");
-    }                                  }
-    // ... existing code ...           return decoded;
-  }                                  }
-  // ... existing code ...           export default validateToken;
+Best for large files (300+ lines) and multiple scattered changes. For small exact replacements, use OpenCode's built-in `edit` tool.
 
-  ┌───────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐
-  │ code_edit │───>│ Morph API │───>│ safety   │───>│ write to │
-  │ + file    │    │ merge     │    │ guards   │    │ disk     │
-  └───────────┘    └───────────┘    └──────────┘    └──────────┘
-                                    marker leak?
-                                    truncation?
-```
+### WarpGrep (`warpgrep_codebase_search`)
 
-Safety guards block writes when: no markers on files >10 lines, markers leak into merged output, or merged output loses >60% chars / >50% lines.
+Fast agentic codebase search. Runs multi-turn ripgrep + file reads to find relevant code contexts. Sub-6s per query. Best for exploratory queries ("how does X work?", "where is Y handled?").
 
-## WarpGrep (`warpgrep_codebase_search`)
+### Public Repo Context (`warpgrep_github_search`)
 
-Fast agentic codebase search. +4% accuracy on SWE-Bench Pro, -15% cost, sub-6s per query.
-
-```
-  Query                               Fast agentic search
-
-  "How does auth                     Turn 1: ripgrep "auth" "token" "jwt"
-   middleware work?"                 Turn 2: read src/middleware/auth.ts
-           │                         Turn 3: ripgrep "verifyToken"
-           v                         Turn 4: read src/utils/jwt.ts
-  ┌──────────────┐                            │
-  │ WarpGrep     │    ┌─────────┐             v
-  │ Agent        │───>│ ripgrep │    ┌──────────────────┐
-  │ (multi-turn) │    │ read    │    │ 5 file contexts  │
-  │              │───>│ ls      │───>│ with line ranges │
-  └──────────────┘    └─────────┘    └──────────────────┘
-    4 turns, sub-6s                   src/middleware/auth.ts:15-42
-                                      src/utils/jwt.ts:1-28
-                                      ...
-```
-
-Use for exploratory queries ("how does X work?", "where is Y handled?"). For exact keyword lookup, use `grep` directly.
-
-## Public Repo Context (`warpgrep_github_search`)
-
-Grounded context search for public GitHub repositories. This is the remote-repo sibling of `warpgrep_codebase_search`.
-
-Use it when the code you want to understand is not checked out locally:
-
-```text
-owner_repo: owner/repo
-search_term: Where is request authentication handled?
-```
-
-```text
-github_url: https://github.com/owner/repo
-search_term: How is retry logic implemented?
-```
-
-The tool returns relevant file contexts from Morph's indexed public repo search without cloning the repository into your workspace.
-
-If the repo locator is wrong, the tool now returns a resolver-style failure with `Did you mean ...` suggestions and a concrete retry target. This helps the agent recover when it knows the product or package name but not the canonical GitHub repo.
-
-## State-of-the-Art Compaction
-
-25,000+ tok/s context compression in under 2 seconds. +0.6% on SWE-Bench Pro, where summarization-based compaction methods all hurt performance. Fires at 100k chars (roughly ~25k tokens, depending on content), before OpenCode's built-in auto-compact (95% context window). Results cached per message set.
-
-```
-  Every LLM call                      Only fires when context is large
-
-  ┌───────────────────────────────────────────────────┐
-  │              Message History (20 msgs)            │
-  │  msg1  msg2  msg3  ...  msg14 │ msg15 ... msg20   │
-  │  ──────── older ─────────────   ── recent (6) ──  │
-  └───────────────────────────────────────────────────┘
-                    │                       │
-        total > 100k chars?                 │
-                    │                       │
-                    v                       │
-          ┌─────────────────┐               │
-          │ Morph Compact   │               │
-          │ API (~2s)       │               │
-          │ 30% kept        │               │
-          └────────┬────────┘               │
-                   │                        │
-                   v                        v
-  ┌───────────────────────────────────────────────────┐
-  │  [compacted summary]   │ msg15  msg16 ... msg20   │
-  │  ────── 1 msg ───────    ──── recent (6) ──────   │
-  └───────────────────────────────────────────────────┘
-              7 messages sent to LLM
-              (cached for subsequent calls)
-```
-
----
-
-## Tool selection guide
-
-| Task | Tool | Why |
-|------|------|-----|
-| Large file (300+ lines) | `morph_edit` | Partial snippets, no exact matching |
-| Multiple scattered changes | `morph_edit` | Batch edits efficiently |
-| Small exact replacement | `edit` | Faster, no API call |
-| New file creation | `write` | morph_edit only edits existing files |
-| Codebase search/exploration | `warpgrep_codebase_search` | Fast agentic search |
-| Public GitHub repo understanding | `warpgrep_github_search` | Grounded context from indexed public repos |
-| Exact keyword lookup | `grep` | Direct ripgrep, no API call |
+Search public GitHub repositories without cloning. Pass an `owner/repo` or GitHub URL and a search query. Returns relevant file contexts from Morph's indexed public repo search.
 
 ---
 
 ## Configuration
 
+All configuration is via environment variables.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MORPH_API_KEY` | required | Your Morph API key |
+| `MORPH_API_KEY` | *required* | Your Morph API key |
+| `MORPH_COMPACT_TOKEN_LIMIT` | auto (70% of model window) | Fixed token threshold for compaction |
+| `MORPH_COMPACT_CONTEXT_THRESHOLD` | `0.7` | Fraction of model context window to trigger compaction (used when `TOKEN_LIMIT` is not set) |
+| `MORPH_COMPACT_PRESERVE_RECENT` | `1` | Number of recent messages to keep uncompacted |
+| `MORPH_COMPACT_RATIO` | `0.3` | Target compression ratio (0.05-1.0, lower = more aggressive) |
+| `MORPH_COMPACT` | `true` | Set `false` to disable compaction |
 | `MORPH_EDIT` | `true` | Set `false` to disable Fast Apply |
 | `MORPH_WARPGREP` | `true` | Set `false` to disable WarpGrep |
-| `MORPH_WARPGREP_GITHUB` | `true` | Set `false` to disable public repo context search |
-| `MORPH_COMPACT` | `true` | Set `false` to disable compaction |
-| `MORPH_COMPACT_CHAR_THRESHOLD` | `100000` | Char count before compaction triggers |
-| `MORPH_COMPACT_RATIO` | `0.3` | Compression ratio (0.05-1.0, lower = more aggressive) |
+| `MORPH_WARPGREP_GITHUB` | `true` | Set `false` to disable public repo search |
 
 ---
 
@@ -202,8 +151,17 @@ If the repo locator is wrong, the tool now returns a resolver-style failure with
 
 ```bash
 bun install
-bun test          # 57 tests
-bun run typecheck # tsc --noEmit
+bun test
+bun run build
+bun run typecheck
+```
+
+To test locally with OpenCode, symlink the plugin:
+
+```bash
+rm -rf ~/.config/opencode/node_modules/@morphllm/opencode-morph-plugin
+ln -s /path/to/this/repo ~/.config/opencode/node_modules/@morphllm/opencode-morph-plugin
+bun run build  # rebuild after changes
 ```
 
 ## License
