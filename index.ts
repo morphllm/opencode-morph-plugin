@@ -826,7 +826,7 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
             {
               originalCode,
               codeEdit: normalizedCodeEdit,
-              instructions,
+              instruction: instructions,
               filepath: target_filepath,
             },
             {
