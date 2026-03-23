@@ -31,7 +31,7 @@ Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) so it persists.
 
 ```bash
 cd ~/.config/opencode
-npm i @morphllm/opencode-morph-plugin
+bun i @morphllm/opencode-morph-plugin
 ```
 
 ### 3. Register in opencode.json
