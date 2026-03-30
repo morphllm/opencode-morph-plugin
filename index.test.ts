@@ -1013,44 +1013,47 @@ describe("formatWarpGrepResult edge cases", () => {
     }
   }
 
-  test("truncated Windows drive-letter contexts produce actionable error, valid contexts still render", async () => {
-    const malformed = await executeSearch({
-      success: true,
-      contexts: [
-        { file: "C", content: "", lines: "*" },
-        { file: "D", content: "", lines: "*" },
-        { file: "E", content: "", lines: "*" },
-      ],
-    });
+  test("contexts with implausible file paths are rejected; valid paths from every OS render normally", async () => {
+    // Implausible: bare letters, empty strings, whitespace, no separators or extensions
+    for (const file of ["C", "", " ", "noextension"]) {
+      const result = await executeSearch({
+        success: true,
+        contexts: [{ file, content: "", lines: "*" }],
+      });
+      expect(result).toContain("malformed");
+      expect(result).not.toContain("<file path=");
+    }
 
-    expect(malformed).toContain("malformed");
-    expect(malformed).toContain("grep");
-    expect(malformed).not.toContain("<file path=");
+    // Valid paths across all major OS conventions
+    const validPaths = [
+      { file: "src/auth.ts", content: "code" },                         // unix relative
+      { file: "/usr/local/bin/server.js", content: "code" },            // unix absolute
+      { file: "C:\\Users\\dev\\project\\main.rs", content: "code" },    // windows absolute
+      { file: "packages\\core\\index.ts", content: "code" },            // windows relative
+      { file: "../sibling/lib.py", content: "code" },                   // relative with ..
+      { file: "./config.yaml", content: "code" },                       // relative with ./
+      { file: "Makefile.toml", content: "code" },                       // dot-extension only
+    ];
 
-    const valid = await executeSearch({
-      success: true,
-      contexts: [
-        { file: "src/auth.ts", content: "export function login() {}", lines: [[1, 10]] as Array<[number, number]> },
-      ],
-    });
-
-    expect(valid).toContain("Relevant context found:");
-    expect(valid).toContain('<file path="src/auth.ts"');
-    expect(valid).not.toContain("malformed");
+    for (const ctx of validPaths) {
+      const result = await executeSearch({
+        success: true,
+        contexts: [{ ...ctx, lines: [[1, 5]] as Array<[number, number]> }],
+      });
+      expect(result).toContain("Relevant context found:");
+      expect(result).toContain(`<file path="${ctx.file}"`);
+    }
   });
 
-  test("missing or undefined error field never surfaces as literal 'undefined'", async () => {
-    const noError = await executeSearch({ success: false });
-    const nullError = await executeSearch({ success: false, error: null });
-    const emptyError = await executeSearch({ success: false, error: "" });
-
-    for (const result of [noError, nullError, emptyError]) {
+  test("falsy error fields never surface literally; explicit errors pass through", async () => {
+    for (const error of [undefined, null, ""]) {
+      const result = await executeSearch({ success: false, error });
       expect(result).toMatch(/^Search failed:/);
       expect(result).not.toContain("undefined");
       expect(result).not.toContain("null");
     }
 
-    const withError = await executeSearch({ success: false, error: "timeout after 60s" });
-    expect(withError).toBe("Search failed: timeout after 60s");
+    const result = await executeSearch({ success: false, error: "timeout after 60s" });
+    expect(result).toBe("Search failed: timeout after 60s");
   });
 });

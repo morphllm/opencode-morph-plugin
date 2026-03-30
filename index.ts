@@ -328,21 +328,14 @@ function buildMorphSystemRoutingHint(): string | null {
 }
 
 /**
- * Check if a single WarpGrep context looks like a truncated Windows drive-letter path.
- * e.g. { file: 'C', content: '', lines: '*' }
+ * Minimal check for a plausible file path on any OS:
+ * - at least one path separator (/ or \) OR a dot-extension
+ * - not empty / whitespace-only
  */
-function isMalformedContext(ctx: { file: string; content: string; lines?: string | unknown }): boolean {
-  return /^[A-Za-z]$/.test(ctx.file) && !ctx.content && ctx.lines === "*";
-}
+const PLAUSIBLE_PATH_RE = /[/\\]|\.[\w]+$/;
 
-/**
- * Check if a WarpGrep result contains malformed Windows-style contexts.
- * Returns true when all (or the majority of) contexts are malformed.
- */
-function hasMalformedContexts(contexts: { file: string; content: string; lines?: string | unknown }[]): boolean {
-  if (contexts.length === 0) return false;
-  const malformedCount = contexts.filter(isMalformedContext).length;
-  return malformedCount > 0 && malformedCount >= contexts.length / 2;
+function isValidContext(ctx: { file: string; content: string }): boolean {
+  return Boolean(ctx.file) && PLAUSIBLE_PATH_RE.test(ctx.file) && ctx.content.length > 0;
 }
 
 /**
@@ -357,22 +350,18 @@ function formatWarpGrepResult(result: WarpGrepResult): string {
     return "No relevant code found. Try rephrasing your search term.";
   }
 
-  if (hasMalformedContexts(result.contexts)) {
-    const malformedFiles = result.contexts
-      .filter(isMalformedContext)
-      .map((ctx) => ctx.file);
-    console.error(
-      `[morph-plugin] Malformed WarpGrep contexts detected: ${malformedFiles.length} context(s) with file values: ${JSON.stringify(malformedFiles)}${result.summary ? ` | summary: ${result.summary}` : ""}`,
-    );
-    return `Search returned malformed file contexts on Windows (for example \`${malformedFiles[0]}\` instead of a full file path).
-This appears to be an upstream SDK Windows path parsing bug.
-Temporary workaround: use \`grep\` + \`read\` for local code search until the SDK fix lands.`;
+  const valid = result.contexts.filter(isValidContext);
+
+  if (valid.length === 0) {
+    const sample = result.contexts.slice(0, 3).map((c) => c.file);
+    return `Search returned malformed file contexts (file values: ${JSON.stringify(sample)}).
+Fallback: use \`grep\` + \`read\` for local code search.`;
   }
 
   const parts: string[] = [];
   parts.push("Relevant context found:");
 
-  for (const ctx of result.contexts) {
+  for (const ctx of valid) {
     const rangeStr =
       !ctx.lines || ctx.lines === "*"
         ? "*"
@@ -382,7 +371,7 @@ Temporary workaround: use \`grep\` + \`read\` for local code search until the SD
 
   parts.push("\nFile contents:\n");
 
-  for (const ctx of result.contexts) {
+  for (const ctx of valid) {
     const rangeStr =
       !ctx.lines || ctx.lines === "*"
         ? ""
