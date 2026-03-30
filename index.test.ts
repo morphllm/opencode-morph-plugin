@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CompactClient } from "@morphllm/morphsdk";
+import { CompactClient, WarpGrepClient } from "@morphllm/morphsdk";
 
 // These are internal to the plugin but duplicated here for testing.
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -989,5 +989,71 @@ describe("ToolContext path resolution", () => {
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("formatWarpGrepResult edge cases", () => {
+  async function executeSearch(fakeResult: unknown): Promise<string> {
+    const original = WarpGrepClient.prototype.execute;
+    WarpGrepClient.prototype.execute = function* () {
+      return fakeResult;
+    } as any;
+
+    try {
+      const { default: MorphPlugin } = await importPluginWithEnv({
+        MORPH_API_KEY: "sk-test-key",
+      });
+      const hooks = await MorphPlugin(makePluginInput("/tmp/morph-warpgrep-test"));
+      return (await hooks.tool.warpgrep_codebase_search.execute(
+        { search_term: "auth flow" },
+        makeToolContext("/tmp/morph-warpgrep-test"),
+      )) as string;
+    } finally {
+      WarpGrepClient.prototype.execute = original;
+    }
+  }
+
+  test("contexts with implausible file paths are rejected; valid paths from every OS render normally", async () => {
+    // Implausible: bare letters, empty strings, whitespace, no separators or extensions
+    for (const file of ["C", "", " ", "noextension"]) {
+      const result = await executeSearch({
+        success: true,
+        contexts: [{ file, content: "", lines: "*" }],
+      });
+      expect(result).toContain("malformed");
+      expect(result).not.toContain("<file path=");
+    }
+
+    // Valid paths across all major OS conventions
+    const validPaths = [
+      { file: "src/auth.ts", content: "code" },                         // unix relative
+      { file: "/usr/local/bin/server.js", content: "code" },            // unix absolute
+      { file: "C:\\Users\\dev\\project\\main.rs", content: "code" },    // windows absolute
+      { file: "packages\\core\\index.ts", content: "code" },            // windows relative
+      { file: "../sibling/lib.py", content: "code" },                   // relative with ..
+      { file: "./config.yaml", content: "code" },                       // relative with ./
+      { file: "Makefile.toml", content: "code" },                       // dot-extension only
+    ];
+
+    for (const ctx of validPaths) {
+      const result = await executeSearch({
+        success: true,
+        contexts: [{ ...ctx, lines: [[1, 5]] as Array<[number, number]> }],
+      });
+      expect(result).toContain("Relevant context found:");
+      expect(result).toContain(`<file path="${ctx.file}"`);
+    }
+  });
+
+  test("falsy error fields never surface literally; explicit errors pass through", async () => {
+    for (const error of [undefined, null, ""]) {
+      const result = await executeSearch({ success: false, error });
+      expect(result).toMatch(/^Search failed:/);
+      expect(result).not.toContain("undefined");
+      expect(result).not.toContain("null");
+    }
+
+    const result = await executeSearch({ success: false, error: "timeout after 60s" });
+    expect(result).toBe("Search failed: timeout after 60s");
   });
 });

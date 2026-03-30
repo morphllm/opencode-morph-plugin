@@ -328,21 +328,40 @@ function buildMorphSystemRoutingHint(): string | null {
 }
 
 /**
+ * Minimal check for a plausible file path on any OS:
+ * - at least one path separator (/ or \) OR a dot-extension
+ * - not empty / whitespace-only
+ */
+const PLAUSIBLE_PATH_RE = /[/\\]|\.[\w]+$/;
+
+function isValidContext(ctx: { file: string; content: string }): boolean {
+  return Boolean(ctx.file) && PLAUSIBLE_PATH_RE.test(ctx.file) && ctx.content.length > 0;
+}
+
+/**
  * Format WarpGrep results for tool output
  */
 function formatWarpGrepResult(result: WarpGrepResult): string {
   if (!result.success) {
-    return `Search failed: ${result.error}`;
+    return `Search failed: ${result.error || "search returned no error details."}`;
   }
 
   if (!result.contexts || result.contexts.length === 0) {
     return "No relevant code found. Try rephrasing your search term.";
   }
 
+  const valid = result.contexts.filter(isValidContext);
+
+  if (valid.length === 0) {
+    const sample = result.contexts.slice(0, 3).map((c) => c.file);
+    return `Search returned malformed file contexts (file values: ${JSON.stringify(sample)}).
+Fallback: use \`grep\` + \`read\` for local code search.`;
+  }
+
   const parts: string[] = [];
   parts.push("Relevant context found:");
 
-  for (const ctx of result.contexts) {
+  for (const ctx of valid) {
     const rangeStr =
       !ctx.lines || ctx.lines === "*"
         ? "*"
@@ -352,7 +371,7 @@ function formatWarpGrepResult(result: WarpGrepResult): string {
 
   parts.push("\nFile contents:\n");
 
-  for (const ctx of result.contexts) {
+  for (const ctx of valid) {
     const rangeStr =
       !ctx.lines || ctx.lines === "*"
         ? ""
