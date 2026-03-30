@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CompactClient } from "@morphllm/morphsdk";
+import { CompactClient, WarpGrepClient } from "@morphllm/morphsdk";
 
 // These are internal to the plugin but duplicated here for testing.
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -989,5 +989,112 @@ describe("ToolContext path resolution", () => {
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WarpGrep malformed Windows result detection (Issue #7)
+// ---------------------------------------------------------------------------
+
+describe("warpgrep_codebase_search malformed Windows results", () => {
+  /**
+   * Helper: patch WarpGrepClient.prototype.execute to return a fake result,
+   * import the plugin fresh, call the tool, then restore the original.
+   */
+  async function executeSearchWithMockedResult(fakeResult: unknown): Promise<string> {
+    const original = WarpGrepClient.prototype.execute;
+    // The plugin calls warpGrep!.execute() which is an async generator.
+    // We mock it to yield nothing and return the fakeResult.
+    WarpGrepClient.prototype.execute = function* () {
+      return fakeResult;
+    } as any;
+
+    try {
+      const { default: MorphPlugin } = await importPluginWithEnv({
+        MORPH_API_KEY: "sk-test-key",
+      });
+      const hooks = await MorphPlugin(makePluginInput("/tmp/morph-warpgrep-test"));
+      const result = await hooks.tool.warpgrep_codebase_search.execute(
+        { search_term: "test query" },
+        makeToolContext("/tmp/morph-warpgrep-test"),
+      );
+      return result as string;
+    } finally {
+      WarpGrepClient.prototype.execute = original;
+    }
+  }
+
+  test("malformed result with file:'C' returns actionable Windows error", async () => {
+    const result = await executeSearchWithMockedResult({
+      success: true,
+      contexts: [
+        { file: "C", content: "", lines: "*" },
+      ],
+    });
+
+    expect(result).toContain("malformed file contexts on Windows");
+    expect(result).toContain("`C`");
+    expect(result).toContain("upstream SDK");
+    expect(result).toContain("grep");
+    expect(result).toContain("read");
+  });
+
+  test("multiple malformed contexts still triggers error", async () => {
+    const result = await executeSearchWithMockedResult({
+      success: true,
+      contexts: [
+        { file: "C", content: "", lines: "*" },
+        { file: "D", content: "", lines: "*" },
+      ],
+    });
+
+    expect(result).toContain("malformed file contexts on Windows");
+  });
+
+  test("missing SDK error string does not produce 'Search failed: undefined'", async () => {
+    const result = await executeSearchWithMockedResult({
+      success: false,
+      error: undefined,
+    });
+
+    expect(result).not.toContain("undefined");
+    expect(result).toContain("Search failed");
+    expect(result).toContain("no error details");
+  });
+
+  test("explicit SDK error string is preserved", async () => {
+    const result = await executeSearchWithMockedResult({
+      success: false,
+      error: "timeout after 60s",
+    });
+
+    expect(result).toContain("Search failed: timeout after 60s");
+  });
+
+  test("valid search results still format normally", async () => {
+    const result = await executeSearchWithMockedResult({
+      success: true,
+      contexts: [
+        {
+          file: "src/auth.ts",
+          content: "export function login() { return true; }",
+          lines: [[1, 5]] as Array<[number, number]>,
+        },
+      ],
+    });
+
+    expect(result).toContain("Relevant context found:");
+    expect(result).toContain("src/auth.ts");
+    expect(result).toContain("export function login()");
+    expect(result).not.toContain("malformed");
+  });
+
+  test("empty contexts returns 'no relevant code' message", async () => {
+    const result = await executeSearchWithMockedResult({
+      success: true,
+      contexts: [],
+    });
+
+    expect(result).toContain("No relevant code found");
   });
 });

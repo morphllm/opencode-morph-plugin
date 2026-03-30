@@ -328,15 +328,45 @@ function buildMorphSystemRoutingHint(): string | null {
 }
 
 /**
+ * Check if a single WarpGrep context looks like a truncated Windows drive-letter path.
+ * e.g. { file: 'C', content: '', lines: '*' }
+ */
+function isMalformedContext(ctx: { file: string; content: string; lines?: string | unknown }): boolean {
+  return /^[A-Za-z]$/.test(ctx.file) && !ctx.content && ctx.lines === "*";
+}
+
+/**
+ * Check if a WarpGrep result contains malformed Windows-style contexts.
+ * Returns true when all (or the majority of) contexts are malformed.
+ */
+function hasMalformedContexts(contexts: { file: string; content: string; lines?: string | unknown }[]): boolean {
+  if (contexts.length === 0) return false;
+  const malformedCount = contexts.filter(isMalformedContext).length;
+  return malformedCount > 0 && malformedCount >= contexts.length / 2;
+}
+
+/**
  * Format WarpGrep results for tool output
  */
 function formatWarpGrepResult(result: WarpGrepResult): string {
   if (!result.success) {
-    return `Search failed: ${result.error}`;
+    return `Search failed: ${result.error || "search returned no error details."}`;
   }
 
   if (!result.contexts || result.contexts.length === 0) {
     return "No relevant code found. Try rephrasing your search term.";
+  }
+
+  if (hasMalformedContexts(result.contexts)) {
+    const malformedFiles = result.contexts
+      .filter(isMalformedContext)
+      .map((ctx) => ctx.file);
+    console.error(
+      `[morph-plugin] Malformed WarpGrep contexts detected: ${malformedFiles.length} context(s) with file values: ${JSON.stringify(malformedFiles)}${result.summary ? ` | summary: ${result.summary}` : ""}`,
+    );
+    return `Search returned malformed file contexts on Windows (for example \`${malformedFiles[0]}\` instead of a full file path).
+This appears to be an upstream SDK Windows path parsing bug.
+Temporary workaround: use \`grep\` + \`read\` for local code search until the SDK fix lands.`;
   }
 
   const parts: string[] = [];
