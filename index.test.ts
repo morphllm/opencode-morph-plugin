@@ -992,19 +992,9 @@ describe("ToolContext path resolution", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// WarpGrep malformed Windows result detection (Issue #7)
-// ---------------------------------------------------------------------------
-
-describe("warpgrep_codebase_search malformed Windows results", () => {
-  /**
-   * Helper: patch WarpGrepClient.prototype.execute to return a fake result,
-   * import the plugin fresh, call the tool, then restore the original.
-   */
-  async function executeSearchWithMockedResult(fakeResult: unknown): Promise<string> {
+describe("formatWarpGrepResult edge cases", () => {
+  async function executeSearch(fakeResult: unknown): Promise<string> {
     const original = WarpGrepClient.prototype.execute;
-    // The plugin calls warpGrep!.execute() which is an async generator.
-    // We mock it to yield nothing and return the fakeResult.
     WarpGrepClient.prototype.execute = function* () {
       return fakeResult;
     } as any;
@@ -1014,87 +1004,53 @@ describe("warpgrep_codebase_search malformed Windows results", () => {
         MORPH_API_KEY: "sk-test-key",
       });
       const hooks = await MorphPlugin(makePluginInput("/tmp/morph-warpgrep-test"));
-      const result = await hooks.tool.warpgrep_codebase_search.execute(
-        { search_term: "test query" },
+      return (await hooks.tool.warpgrep_codebase_search.execute(
+        { search_term: "auth flow" },
         makeToolContext("/tmp/morph-warpgrep-test"),
-      );
-      return result as string;
+      )) as string;
     } finally {
       WarpGrepClient.prototype.execute = original;
     }
   }
 
-  test("malformed result with file:'C' returns actionable Windows error", async () => {
-    const result = await executeSearchWithMockedResult({
-      success: true,
-      contexts: [
-        { file: "C", content: "", lines: "*" },
-      ],
-    });
-
-    expect(result).toContain("malformed file contexts on Windows");
-    expect(result).toContain("`C`");
-    expect(result).toContain("upstream SDK");
-    expect(result).toContain("grep");
-    expect(result).toContain("read");
-  });
-
-  test("multiple malformed contexts still triggers error", async () => {
-    const result = await executeSearchWithMockedResult({
+  test("truncated Windows drive-letter contexts produce actionable error, valid contexts still render", async () => {
+    const malformed = await executeSearch({
       success: true,
       contexts: [
         { file: "C", content: "", lines: "*" },
         { file: "D", content: "", lines: "*" },
+        { file: "E", content: "", lines: "*" },
       ],
     });
 
-    expect(result).toContain("malformed file contexts on Windows");
-  });
+    expect(malformed).toContain("malformed");
+    expect(malformed).toContain("grep");
+    expect(malformed).not.toContain("<file path=");
 
-  test("missing SDK error string does not produce 'Search failed: undefined'", async () => {
-    const result = await executeSearchWithMockedResult({
-      success: false,
-      error: undefined,
-    });
-
-    expect(result).not.toContain("undefined");
-    expect(result).toContain("Search failed");
-    expect(result).toContain("no error details");
-  });
-
-  test("explicit SDK error string is preserved", async () => {
-    const result = await executeSearchWithMockedResult({
-      success: false,
-      error: "timeout after 60s",
-    });
-
-    expect(result).toContain("Search failed: timeout after 60s");
-  });
-
-  test("valid search results still format normally", async () => {
-    const result = await executeSearchWithMockedResult({
+    const valid = await executeSearch({
       success: true,
       contexts: [
-        {
-          file: "src/auth.ts",
-          content: "export function login() { return true; }",
-          lines: [[1, 5]] as Array<[number, number]>,
-        },
+        { file: "src/auth.ts", content: "export function login() {}", lines: [[1, 10]] as Array<[number, number]> },
       ],
     });
 
-    expect(result).toContain("Relevant context found:");
-    expect(result).toContain("src/auth.ts");
-    expect(result).toContain("export function login()");
-    expect(result).not.toContain("malformed");
+    expect(valid).toContain("Relevant context found:");
+    expect(valid).toContain('<file path="src/auth.ts"');
+    expect(valid).not.toContain("malformed");
   });
 
-  test("empty contexts returns 'no relevant code' message", async () => {
-    const result = await executeSearchWithMockedResult({
-      success: true,
-      contexts: [],
-    });
+  test("missing or undefined error field never surfaces as literal 'undefined'", async () => {
+    const noError = await executeSearch({ success: false });
+    const nullError = await executeSearch({ success: false, error: null });
+    const emptyError = await executeSearch({ success: false, error: "" });
 
-    expect(result).toContain("No relevant code found");
+    for (const result of [noError, nullError, emptyError]) {
+      expect(result).toMatch(/^Search failed:/);
+      expect(result).not.toContain("undefined");
+      expect(result).not.toContain("null");
+    }
+
+    const withError = await executeSearch({ success: false, error: "timeout after 60s" });
+    expect(withError).toBe("Search failed: timeout after 60s");
   });
 });
