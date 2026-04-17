@@ -9,7 +9,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CompactClient, WarpGrepClient } from "@morphllm/morphsdk";
+import { CompactClient } from "@morphllm/morphsdk/tools/compact";
+import { WarpGrepClient } from "@morphllm/morphsdk/tools/warp-grep/client";
 
 // These are internal to the plugin but duplicated here for testing.
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -115,6 +116,40 @@ describe("packaged tool-selection instructions", () => {
     expect(content).toContain("MORPH_API_KEY");
     expect(content).toContain("MORPH_COMPACT_TOKEN_LIMIT");
     expect(content).toContain("opencode.json");
+  });
+
+  test("source uses narrow Morph SDK entrypoints", () => {
+    const content = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
+
+    expect(content).toContain('@morphllm/morphsdk/tools/fastapply');
+    expect(content).toContain('@morphllm/morphsdk/tools/warp-grep/client');
+    expect(content).toContain('@morphllm/morphsdk/tools/compact');
+    expect(content).not.toContain(
+      'import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";',
+    );
+  });
+
+  test("build pipeline bundles morphsdk compatibility layer", () => {
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dir, "package.json"), "utf-8"),
+    ) as {
+      scripts?: Record<string, string>;
+    };
+    const tsupConfig = readFileSync(
+      join(import.meta.dir, "tsup.config.ts"),
+      "utf-8",
+    );
+
+    expect(pkg.scripts?.build).toBe("tsup --config tsup.config.ts");
+    expect(tsupConfig).toContain("noExternal");
+    expect(tsupConfig).toMatch(/@morphllm\\\/morphsdk/);
+  });
+
+  test("local WarpGrep uses non-streaming execution for stable final results", () => {
+    const content = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
+
+    expect(content).toContain("const result = await warpGrep!.execute({");
+    expect(content).not.toContain("streamSteps: true");
   });
 });
 
@@ -995,7 +1030,7 @@ describe("ToolContext path resolution", () => {
 describe("formatWarpGrepResult edge cases", () => {
   async function executeSearch(fakeResult: unknown): Promise<string> {
     const original = WarpGrepClient.prototype.execute;
-    WarpGrepClient.prototype.execute = function* () {
+    WarpGrepClient.prototype.execute = async function () {
       return fakeResult;
     } as any;
 
