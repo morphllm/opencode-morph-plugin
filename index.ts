@@ -2,13 +2,16 @@
  * OpenCode Morph Plugin v2
  *
  * Integrates Morph SDK for fast apply, WarpGrep codebase search, and shell env.
- * Uses MorphClient for shared config (API key, timeout, retries) across all tools.
+ * Uses narrow Morph SDK entrypoints so OpenCode does not eagerly load unrelated
+ * ESM/CJS edges during plugin startup.
  *
  * @see https://docs.morphllm.com/quickstart
  */
 
 import { type Plugin, tool } from "@opencode-ai/plugin";
-import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
+import { applyEdit } from "@morphllm/morphsdk/tools/fastapply";
+import { WarpGrepClient } from "@morphllm/morphsdk/tools/warp-grep/client";
+import { CompactClient } from "@morphllm/morphsdk/tools/compact";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import { isAbsolute, resolve as resolvePath } from "node:path";
@@ -73,17 +76,6 @@ const PLUGIN_VERSION = "2.0.0";
 /** Canonical marker string used for lazy edit placeholders */
 const EXISTING_CODE_MARKER = "// ... existing code ...";
 const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
-
-/**
- * Shared MorphClient — FastApply uses morph.fastApply.applyEdit()
- * with MORPH_API_URL passed as per-call override.
- */
-const morph = MORPH_API_KEY
-  ? new MorphClient({
-      apiKey: MORPH_API_KEY,
-      timeout: MORPH_TIMEOUT,
-    })
-  : null;
 
 /**
  * Separate WarpGrep client with its own timeout (typically longer than fast apply).
@@ -693,20 +685,9 @@ const MorphPlugin: Plugin = async ({ directory, worktree, client }) => {
     } catch {}
   };
 
-  if (!MORPH_API_KEY) {
-    await log(
-      "warn",
-      "MORPH_API_KEY not set - morph tools will be disabled",
-    );
-  } else {
-    const features = [
-      MORPH_EDIT_ENABLED && "edit",
-      MORPH_WARPGREP_ENABLED && "warpgrep",
-      MORPH_WARPGREP_GITHUB_ENABLED && "warpgrep-github",
-      MORPH_COMPACT_ENABLED && "compact",
-    ].filter(Boolean);
-    await log("info", `Plugin v${PLUGIN_VERSION} loaded [${features.join(", ")}]`);
-  }
+  // Avoid networked startup logging so short-lived OpenCode commands like
+  // `opencode debug config` can load the plugin without leaving a pending
+  // app.log request alive in the host process.
 
   // Build tool map conditionally based on feature flags
   const tools: Record<string, ReturnType<typeof tool>> = {};
@@ -841,7 +822,7 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
 
           // Call Morph SDK to merge the edit
           const startTime = Date.now();
-          const result = await morph!.fastApply.applyEdit(
+          const result = await applyEdit(
             {
               originalCode,
               codeEdit: normalizedCodeEdit,
@@ -849,7 +830,9 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
               filepath: target_filepath,
             },
             {
+              morphApiKey: MORPH_API_KEY,
               morphApiUrl: MORPH_API_URL,
+              timeout: MORPH_TIMEOUT,
               generateUdiff: true,
             },
           );
@@ -967,37 +950,22 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           const startTime = Date.now();
 
           try {
-            const generator = warpGrep!.execute({
+            // The current Morph SDK streaming branch can return an unusable final
+            // result in OpenCode even when a direct execute() succeeds. Prefer the
+            // non-streaming path here so the tool remains reliably usable.
+            const result = await warpGrep!.execute({
               searchTerm: args.search_term,
               repoRoot: resolveSessionRepoRoot(
                 directory,
                 worktree,
               ),
-              streamSteps: true,
             });
-
-            let turnCount = 0;
-            let result: WarpGrepResult;
-
-            for (;;) {
-              const { value, done } = await generator.next();
-              if (done) {
-                result = value;
-                break;
-              }
-              turnCount = value.turn;
-              await log(
-                "debug",
-                `WarpGrep turn ${value.turn}: ${value.toolCalls?.map((tc: { name: string }) => tc.name).join(", ") ?? "..."}`,
-              );
-            }
-
             const duration = Date.now() - startTime;
             const contextCount = result.contexts?.length ?? 0;
 
             await log(
               "info",
-              `WarpGrep: ${contextCount} contexts in ${turnCount} turns (${duration}ms)`,
+              `WarpGrep: ${contextCount} contexts (${duration}ms)`,
             );
 
             return formatWarpGrepResult(result);
