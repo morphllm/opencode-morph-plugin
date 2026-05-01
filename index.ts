@@ -13,8 +13,8 @@ import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 
-// Config from environment — only MORPH_API_KEY is required
-const MORPH_API_KEY = process.env.MORPH_API_KEY;
+// API key can be configured via plugin options or MORPH_API_KEY.
+const MORPH_ENV_API_KEY = normalizeApiKey(process.env.MORPH_API_KEY);
 const MORPH_API_URL = "https://api.morphllm.com";
 const MORPH_TIMEOUT = 30000;
 const MORPH_WARP_GREP_TIMEOUT = 60000;
@@ -75,39 +75,6 @@ const EXISTING_CODE_MARKER = "// ... existing code ...";
 const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
 
 /**
- * Shared MorphClient — FastApply uses morph.fastApply.applyEdit()
- * with MORPH_API_URL passed as per-call override.
- */
-const morph = MORPH_API_KEY
-  ? new MorphClient({
-      apiKey: MORPH_API_KEY,
-      timeout: MORPH_TIMEOUT,
-    })
-  : null;
-
-/**
- * Separate WarpGrep client with its own timeout (typically longer than fast apply).
- */
-const warpGrep = MORPH_API_KEY
-  ? new WarpGrepClient({
-      morphApiKey: MORPH_API_KEY,
-      morphApiUrl: MORPH_API_URL,
-      timeout: MORPH_WARP_GREP_TIMEOUT,
-    })
-  : null;
-
-/**
- * Separate CompactClient for context compaction.
- */
-const compactClient = MORPH_API_KEY
-  ? new CompactClient({
-      morphApiKey: MORPH_API_KEY,
-      morphApiUrl: MORPH_API_URL,
-      timeout: MORPH_COMPACT_TIMEOUT,
-    })
-  : null;
-
-/**
  * Model context window size in tokens. Updated from chat.params hook.
  * Default is conservative — actual value captured on first LLM call.
  */
@@ -126,6 +93,52 @@ let compactionState: {
   compactedUpToIndex: number;
   frozenChars: number;
 } | null = null;
+
+type MorphPluginOptions = {
+  apiKey?: unknown;
+};
+
+function normalizeApiKey(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function resolveMorphApiKey(options?: MorphPluginOptions): string | undefined {
+  return normalizeApiKey(options?.apiKey) ?? MORPH_ENV_API_KEY;
+}
+
+function createMorphClients(apiKey: string | undefined): {
+  morph: MorphClient | null;
+  warpGrep: WarpGrepClient | null;
+  compactClient: CompactClient | null;
+} {
+  if (!apiKey) {
+    return {
+      morph: null,
+      warpGrep: null,
+      compactClient: null,
+    };
+  }
+
+  return {
+    morph: new MorphClient({
+      apiKey,
+      timeout: MORPH_TIMEOUT,
+    }),
+    warpGrep: new WarpGrepClient({
+      morphApiKey: apiKey,
+      morphApiUrl: MORPH_API_URL,
+      timeout: MORPH_WARP_GREP_TIMEOUT,
+    }),
+    compactClient: new CompactClient({
+      morphApiKey: apiKey,
+      morphApiUrl: MORPH_API_URL,
+      timeout: MORPH_COMPACT_TIMEOUT,
+    }),
+  };
+}
 
 /**
  * Normalize code_edit input from LLM tool calls.
@@ -238,7 +251,10 @@ function appendRuntimeNotes(description: string, notes: string[]): string {
   return `${description}\n\nRuntime notes:\n${notes.map((note) => `- ${note}`).join("\n")}`;
 }
 
-function buildToolRuntimeNotes(toolID: string): string[] {
+function buildToolRuntimeNotes(
+  toolID: string,
+  apiKey: string | undefined,
+): string[] {
   switch (toolID) {
     case "morph_edit": {
       const notes = [
@@ -251,8 +267,8 @@ function buildToolRuntimeNotes(toolID: string): string[] {
         );
       }
 
-      if (!MORPH_API_KEY) {
-        notes.push("Currently unavailable until MORPH_API_KEY is configured.");
+      if (!apiKey) {
+        notes.push("Currently unavailable until a Morph API key is configured.");
       }
 
       return notes;
@@ -263,8 +279,8 @@ function buildToolRuntimeNotes(toolID: string): string[] {
         "Searches the current project worktree, not just the immediate cwd.",
       ];
 
-      if (!MORPH_API_KEY) {
-        notes.push("Currently unavailable until MORPH_API_KEY is configured.");
+      if (!apiKey) {
+        notes.push("Currently unavailable until a Morph API key is configured.");
       }
 
       return notes;
@@ -275,8 +291,8 @@ function buildToolRuntimeNotes(toolID: string): string[] {
         "Use this for public GitHub source questions, not the current checked-out repo.",
       ];
 
-      if (!MORPH_API_KEY) {
-        notes.push("Currently unavailable until MORPH_API_KEY is configured.");
+      if (!apiKey) {
+        notes.push("Currently unavailable until a Morph API key is configured.");
       }
 
       return notes;
@@ -287,11 +303,11 @@ function buildToolRuntimeNotes(toolID: string): string[] {
   }
 }
 
-function buildMorphSystemRoutingHint(): string | null {
-  if (!MORPH_API_KEY) {
+function buildMorphSystemRoutingHint(apiKey: string | undefined): string | null {
+  if (!apiKey) {
     return [
       MORPH_ROUTING_HINT_HEADER,
-      "- Morph remote tools are currently unavailable because MORPH_API_KEY is not configured.",
+      "- Morph remote tools are currently unavailable because no Morph API key is configured.",
       "- Use native edit/write/grep tools until Morph credentials are configured.",
     ].join("\n");
   }
@@ -664,7 +680,13 @@ async function fetchGitHubRepoSuggestions(
   });
 }
 
-const MorphPlugin: Plugin = async ({ directory, worktree, client }) => {
+const MorphPlugin: Plugin = async (
+  { directory, worktree, client },
+  options?: MorphPluginOptions,
+) => {
+  const morphApiKey = resolveMorphApiKey(options);
+  const { morph, warpGrep, compactClient } = createMorphClients(morphApiKey);
+
   const log = async (
     level: "debug" | "info" | "warn" | "error",
     message: string,
@@ -693,10 +715,10 @@ const MorphPlugin: Plugin = async ({ directory, worktree, client }) => {
     } catch {}
   };
 
-  if (!MORPH_API_KEY) {
+  if (!morphApiKey) {
     await log(
       "warn",
-      "MORPH_API_KEY not set - morph tools will be disabled",
+      "Morph API key not configured - morph tools will be disabled",
     );
   } else {
     const features = [
@@ -785,10 +807,10 @@ Options:
             directory,
           );
 
-          if (!MORPH_API_KEY) {
-            return `Error: MORPH_API_KEY not configured.
+          if (!morphApiKey) {
+            return `Error: Morph API key not configured.
 
-To use morph_edit, set the MORPH_API_KEY environment variable.
+To use morph_edit, set the plugin apiKey option or the MORPH_API_KEY environment variable.
 Get your API key at: https://morphllm.com/dashboard/api-keys
 
 Alternatively, use the native 'edit' tool for this change.`;
@@ -957,10 +979,10 @@ For exact keyword searches (specific function names, variable names), prefer gre
         },
 
         async execute(args, context) {
-          if (!MORPH_API_KEY) {
-            return `Error: MORPH_API_KEY not configured.
+          if (!morphApiKey) {
+            return `Error: Morph API key not configured.
 
-To use warpgrep_codebase_search, set the MORPH_API_KEY environment variable.
+To use warpgrep_codebase_search, set the plugin apiKey option or the MORPH_API_KEY environment variable.
 Get your API key at: https://morphllm.com/dashboard/api-keys`;
           }
 
@@ -1061,10 +1083,10 @@ Provide exactly one repository locator:
         },
 
         async execute(args) {
-          if (!MORPH_API_KEY) {
-            return `Error: MORPH_API_KEY not configured.
+          if (!morphApiKey) {
+            return `Error: Morph API key not configured.
 
-To use warpgrep_github_search, set the MORPH_API_KEY environment variable.
+To use warpgrep_github_search, set the plugin apiKey option or the MORPH_API_KEY environment variable.
 Get your API key at: https://morphllm.com/dashboard/api-keys`;
           }
 
@@ -1121,13 +1143,13 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
   };
 
   hooks["tool.definition"] = async (input: any, output: any) => {
-    const notes = buildToolRuntimeNotes(input.toolID);
+    const notes = buildToolRuntimeNotes(input.toolID, morphApiKey);
     if (notes.length === 0) return;
 
     output.description = appendRuntimeNotes(output.description, notes);
   };
 
-  const systemRoutingHint = buildMorphSystemRoutingHint();
+  const systemRoutingHint = buildMorphSystemRoutingHint(morphApiKey);
   if (systemRoutingHint) {
     hooks["experimental.chat.system.transform"] = async (
       _input: any,
@@ -1238,7 +1260,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
     // preserving the LLM provider's prompt prefix cache.
     // Re-compaction only fires when the threshold is crossed again.
     hooks["experimental.chat.messages.transform"] = async (_input: any, output: any) => {
-      if (!MORPH_API_KEY) return;
+      if (!morphApiKey) return;
 
       const messages = output.messages;
 

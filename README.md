@@ -19,7 +19,9 @@ On production repos and SWE-Bench Pro, enabling WarpGrep and compaction improves
 
 ### 1. Get a Morph API key
 
-Sign up at [morphllm.com/dashboard](https://morphllm.com/dashboard/api-keys) and export it:
+Sign up at [morphllm.com/dashboard](https://morphllm.com/dashboard/api-keys).
+
+For terminal usage, export it:
 
 ```bash
 export MORPH_API_KEY="sk-..."
@@ -47,6 +49,30 @@ Edit `~/.config/opencode/opencode.json`:
   ]
 }
 ```
+
+For OpenCode desktop or other environments where shell environment variables
+are inconvenient, configure the API key as a plugin option in your global
+OpenCode config:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "@morphllm/opencode-morph-plugin",
+      {
+        "apiKey": "{file:~/.secrets/morph-api-key}"
+      }
+    ]
+  ],
+  "instructions": [
+    "node_modules/@morphllm/opencode-morph-plugin/instructions/morph-tools.md"
+  ]
+}
+```
+
+You can also set `"apiKey": "sk-..."` directly, but prefer global config or
+`{file:...}` for secrets. Do not commit API keys in project config.
 
 ### 4. Start OpenCode
 
@@ -131,11 +157,14 @@ Search public GitHub repositories without cloning. Pass an `owner/repo` or GitHu
 
 ## Configuration
 
-All configuration is via environment variables.
+Credentials can be configured with the plugin `apiKey` option or the
+`MORPH_API_KEY` environment variable. The plugin option is checked first; if it
+is missing or blank, `MORPH_API_KEY` is used.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MORPH_API_KEY` | *required* | Your Morph API key |
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Plugin option `"apiKey"` | falls back to `MORPH_API_KEY` | Your Morph API key in the OpenCode `plugin` config entry |
+| `MORPH_API_KEY` | *required unless `apiKey` is set* | Your Morph API key |
 | `MORPH_COMPACT_TOKEN_LIMIT` | auto (70% of model window) | Fixed token threshold for compaction |
 | `MORPH_COMPACT_CONTEXT_THRESHOLD` | `0.7` | Fraction of model context window to trigger compaction (used when `TOKEN_LIMIT` is not set) |
 | `MORPH_COMPACT_PRESERVE_RECENT` | `1` | Number of recent messages to keep uncompacted |

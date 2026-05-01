@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin config API key** — `apiKey` can now be set in the OpenCode plugin config entry, with `MORPH_API_KEY` preserved as the fallback.
+
 ## [2.0.3] - 2026-03-16
 
 ### Fixed
