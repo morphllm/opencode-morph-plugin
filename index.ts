@@ -982,7 +982,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
             for (;;) {
               const { value, done } = await generator.next();
               if (done) {
-                result = value;
+                result = await value;
                 break;
               }
               turnCount = value.turn;

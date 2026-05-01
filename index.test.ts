@@ -1013,6 +1013,26 @@ describe("formatWarpGrepResult edge cases", () => {
     }
   }
 
+  test("awaits promised final result from streaming WarpGrep execution", async () => {
+    const result = await executeSearch(
+      Promise.resolve({
+        success: true,
+        contexts: [
+          {
+            file: "src/search.ts",
+            content: "export const search = true;",
+            lines: [[1, 1]] as Array<[number, number]>,
+          },
+        ],
+      }),
+    );
+
+    expect(result).toContain("Relevant context found:");
+    expect(result).toContain("- src/search.ts:1-1");
+    expect(result).toContain('<file path="src/search.ts" lines="1-1">');
+    expect(result).not.toContain("Search failed:");
+  });
+
   test("contexts with implausible file paths are rejected; valid paths from every OS render normally", async () => {
     // Implausible: bare letters, empty strings, whitespace, no separators or extensions
     for (const file of ["C", "", " ", "noextension"]) {
