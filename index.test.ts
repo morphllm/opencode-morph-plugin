@@ -114,6 +114,8 @@ describe("packaged tool-selection instructions", () => {
     expect(content).toContain("warpgrep_github_search");
     expect(content).toContain("MORPH_API_KEY");
     expect(content).toContain("MORPH_COMPACT_TOKEN_LIMIT");
+    expect(content).toContain("OpenCode native compaction");
+    expect(content).toContain("sidebar");
     expect(content).toContain("opencode.json");
   });
 });
@@ -962,6 +964,103 @@ describe("plugin runtime hooks", () => {
       "Prefer morph_edit for large or scattered edits inside existing files.",
     );
     expect(combined).toContain("Use write for brand new files.");
+  });
+
+  test("native session compaction is pre-compressed by Morph while preserving OpenCode prompt anchoring", async () => {
+    const originalCompact = CompactClient.prototype.compact;
+    const logs: any[] = [];
+    const toasts: any[] = [];
+    let capturedCompactArgs: any;
+
+    CompactClient.prototype.compact = async function (args: any) {
+      capturedCompactArgs = args;
+      return {
+        output: "condensed task summary",
+        messages: [{ role: "user", content: "condensed task summary" }],
+        usage: {
+          compression_ratio: 0.2,
+          processing_time_ms: 42,
+          input_tokens: 100,
+          output_tokens: 20,
+        },
+      } as any;
+    };
+
+    try {
+      const { default: MorphPlugin } = await importPluginWithEnv({
+        MORPH_API_KEY: "sk-test-key",
+        MORPH_COMPACT_TOKEN_LIMIT: undefined,
+      });
+
+      const input = makePluginInput("/tmp/morph-plugin") as any;
+      input.client = {
+        app: {
+          log: async ({ body }: any) => {
+            logs.push(body);
+          },
+        },
+        tui: {
+          showToast: async ({ body }: any) => {
+            toasts.push(body);
+          },
+        },
+      };
+
+      const hooks = await MorphPlugin(input);
+      const compactingOutput: { context: string[]; prompt?: string } = {
+        context: [],
+      };
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "session-test" },
+        compactingOutput,
+      );
+
+      expect(compactingOutput.prompt).toBeUndefined();
+      expect(compactingOutput.context).toHaveLength(1);
+      expect(compactingOutput.context[0]).toContain(
+        "Morph compact plugin is active",
+      );
+      expect(compactingOutput.context[0]).toContain("Morph-compressed history");
+
+      const output = {
+        messages: [
+          makeTextMsg("msg-1", "user", "please refactor auth"),
+          makeTextMsg(
+            "msg-2",
+            "assistant",
+            "read src/auth.ts and found token storage",
+          ),
+        ],
+      };
+
+      await hooks["experimental.chat.messages.transform"]?.({}, output as any);
+
+      expect(capturedCompactArgs.messages).toEqual([
+        { role: "user", content: "please refactor auth" },
+        {
+          role: "assistant",
+          content: "read src/auth.ts and found token storage",
+        },
+      ]);
+      expect(capturedCompactArgs.preserveRecent).toBe(0);
+      expect(output.messages).toHaveLength(1);
+      expect(output.messages[0]!.parts[0]!.type).toBe("text");
+      expect((output.messages[0]!.parts[0] as any).text).toContain(
+        "Morph-compressed conversation history",
+      );
+      expect((output.messages[0]!.parts[0] as any).text).toContain(
+        "condensed task summary",
+      );
+      expect(toasts[0]!.message).toContain(
+        "Prepared OpenCode compaction with Morph",
+      );
+      expect(logs.some((entry) => entry.message.includes("persisted summary"))).toBe(
+        true,
+      );
+    } finally {
+      CompactClient.prototype.compact = originalCompact;
+    }
   });
 });
 
