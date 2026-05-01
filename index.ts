@@ -2,16 +2,29 @@
  * OpenCode Morph Plugin v2
  *
  * Integrates Morph SDK for fast apply, WarpGrep codebase search, and shell env.
- * Uses MorphClient for shared config (API key, timeout, retries) across all tools.
+ * Uses narrowly scoped Morph SDK entrypoints so opencode can load the plugin
+ * without evaluating SDK adapters that are not needed by this plugin.
  *
  * @see https://docs.morphllm.com/quickstart
  */
 
 import { type Plugin, tool } from "@opencode-ai/plugin";
-import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
-import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
+import { applyEdit, CompactClient } from "@morphllm/morphsdk/edge";
+import { WarpGrepClient } from "@morphllm/morphsdk/tools/warp-grep/client";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
-import { isAbsolute, resolve as resolvePath } from "node:path";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import {
+  readdir,
+  readFile,
+  stat as statAsync,
+} from "node:fs/promises";
+import {
+  isAbsolute,
+  join as joinPath,
+  relative as relativePath,
+  resolve as resolvePath,
+} from "node:path";
 
 // Config from environment — only MORPH_API_KEY is required
 const MORPH_API_KEY = process.env.MORPH_API_KEY;
@@ -74,16 +87,95 @@ const PLUGIN_VERSION = "2.0.0";
 const EXISTING_CODE_MARKER = "// ... existing code ...";
 const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
 
-/**
- * Shared MorphClient — FastApply uses morph.fastApply.applyEdit()
- * with MORPH_API_URL passed as per-call override.
- */
-const morph = MORPH_API_KEY
-  ? new MorphClient({
-      apiKey: MORPH_API_KEY,
-      timeout: MORPH_TIMEOUT,
-    })
-  : null;
+type WarpGrepResult = {
+  success: boolean;
+  error?: string | null;
+  contexts?: Array<{
+    file: string;
+    content: string;
+    lines?: "*" | Array<[number, number]>;
+  }>;
+};
+
+type ExecResult = {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+};
+
+type WarpGrepProvider = {
+  grep(params: {
+    pattern: string;
+    path: string;
+    glob?: string;
+    context_lines?: number;
+    case_sensitive?: boolean;
+  }): Promise<{ lines: string[]; error?: string }>;
+  read(params: {
+    path: string;
+    start?: number;
+    end?: number;
+  }): Promise<{ lines: string[]; error?: string }>;
+  listDirectory(params: {
+    path: string;
+    pattern?: string | null;
+    maxResults?: number;
+    maxDepth?: number;
+  }): Promise<Array<{ name: string; path: string; type: "file" | "dir"; depth: number }>>;
+  glob(params: {
+    pattern: string;
+    path?: string;
+  }): Promise<{ files: string[]; searchDir: string; totalFound: number; error?: string }>;
+};
+
+type CompactResult = {
+  output: string;
+  messages: Array<{
+    role: string;
+    content: string;
+  }>;
+  usage: {
+    compression_ratio: number;
+    processing_time_ms: number;
+  };
+};
+
+const requireFromPlugin = createRequire(import.meta.url);
+
+const LOCAL_SEARCH_SKIP_NAMES = new Set([
+  ".git",
+  ".svn",
+  ".hg",
+  ".bzr",
+  "node_modules",
+  "bower_components",
+  ".pnpm",
+  ".yarn",
+  "vendor",
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  ".cache",
+  ".turbo",
+  ".next",
+  ".nuxt",
+  ".idea",
+  ".vscode",
+  "tmp",
+  "temp",
+]);
+
+const LOCAL_SEARCH_SKIP_EXTENSIONS = [
+  ".min.js",
+  ".min.css",
+  ".bundle.js",
+  ".wasm",
+  ".so",
+  ".dll",
+  ".pyc",
+  ".map",
+];
 
 /**
  * Separate WarpGrep client with its own timeout (typically longer than fast apply).
@@ -230,6 +322,319 @@ function resolveSessionRepoRoot(
   sessionWorktree: string,
 ): string {
   return sessionWorktree || sessionDirectory;
+}
+
+function resolveUnderRepo(repoRoot: string, targetPath: string): string {
+  const absRoot = resolvePath(repoRoot);
+  const resolved = isAbsolute(targetPath)
+    ? resolvePath(targetPath)
+    : resolvePath(absRoot, targetPath || ".");
+  const rel = relativePath(absRoot, resolved);
+
+  if (rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error(`Path outside repository root: ${targetPath}`);
+  }
+
+  return resolved;
+}
+
+function toRepoRelative(repoRoot: string, absPath: string): string {
+  return relativePath(resolvePath(repoRoot), resolvePath(absPath));
+}
+
+function shouldSkipLocalSearchEntry(name: string): boolean {
+  if (LOCAL_SEARCH_SKIP_NAMES.has(name)) return true;
+  if (name.startsWith(".")) return true;
+  return LOCAL_SEARCH_SKIP_EXTENSIONS.some((ext) => name.endsWith(ext));
+}
+
+function getBundledRipgrepPath(): string | undefined {
+  try {
+    const mod = requireFromPlugin("@vscode/ripgrep") as { rgPath?: unknown };
+    return typeof mod.rgPath === "string" ? mod.rgPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function ripgrepCandidates(): string[] {
+  const candidates = [
+    process.env.RG_PATH,
+    getBundledRipgrepPath(),
+    "rg",
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  return Array.from(new Set(candidates));
+}
+
+function localSearchRipgrepExcludes(): string[] {
+  return [
+    ...Array.from(LOCAL_SEARCH_SKIP_NAMES).flatMap((name) => [
+      "-g",
+      `!${name}`,
+    ]),
+    ...LOCAL_SEARCH_SKIP_EXTENSIONS.flatMap((ext) => ["-g", `!*${ext}`]),
+    "-g",
+    "!.*",
+  ];
+}
+
+function spawnCommand(
+  command: string,
+  args: string[],
+  opts: { cwd?: string } = {},
+): Promise<ExecResult> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: opts.cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const finish = (result: ExecResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("close", (code) => {
+      finish({
+        stdout,
+        stderr,
+        exitCode: typeof code === "number" ? code : -1,
+      });
+    });
+    child.on("error", (error) => {
+      finish({ stdout: "", stderr: error.message, exitCode: -1 });
+    });
+  });
+}
+
+async function runLocalRipgrep(
+  args: string[],
+  cwd: string,
+): Promise<ExecResult> {
+  const errors: string[] = [];
+
+  for (const candidate of ripgrepCandidates()) {
+    const result = await spawnCommand(candidate, args, { cwd });
+    if (result.exitCode !== -1) return result;
+    errors.push(`${candidate}: ${result.stderr || "failed to spawn"}`);
+  }
+
+  return {
+    stdout: "",
+    stderr:
+      errors.length > 0
+        ? `Failed to spawn ripgrep. ${errors.join("; ")}`
+        : "Failed to spawn ripgrep. No candidates available.",
+    exitCode: -1,
+  };
+}
+
+function createLocalWarpGrepProvider(repoRoot: string): WarpGrepProvider {
+  const absRoot = resolvePath(repoRoot);
+
+  return {
+    async grep(params) {
+      let absTarget: string;
+      try {
+        absTarget = resolveUnderRepo(absRoot, params.path || ".");
+      } catch (error) {
+        return {
+          lines: [],
+          error: `[PATH ERROR] ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      const targetArg =
+        absTarget === absRoot ? "." : toRepoRelative(absRoot, absTarget);
+      const contextLines =
+        params.context_lines === undefined ? "1" : String(params.context_lines);
+      const args = [
+        "--no-config",
+        "--no-heading",
+        "--with-filename",
+        "--line-number",
+        "--color=never",
+        "--trim",
+        "--max-columns=400",
+        "-C",
+        contextLines,
+        ...(params.case_sensitive === false ? ["--ignore-case"] : []),
+        ...(params.glob ? ["--glob", params.glob] : []),
+        ...localSearchRipgrepExcludes(),
+        params.pattern,
+        targetArg || ".",
+      ];
+      const result = await runLocalRipgrep(args, absRoot);
+
+      if (result.exitCode === -1) {
+        return {
+          lines: [],
+          error: `[RIPGREP NOT AVAILABLE] ${result.stderr}`,
+        };
+      }
+
+      if (result.exitCode !== 0 && result.exitCode !== 1) {
+        return {
+          lines: [],
+          error: `[RIPGREP ERROR] grep failed with exit code ${result.exitCode}${result.stderr ? `: ${result.stderr}` : ""}`,
+        };
+      }
+
+      return {
+        lines: result.stdout
+          .trim()
+          .split(/\r?\n/)
+          .filter((line) => line.length > 0),
+      };
+    },
+
+    async read(params) {
+      let absTarget: string;
+      try {
+        absTarget = resolveUnderRepo(absRoot, params.path);
+        const info = await statAsync(absTarget);
+        if (!info.isFile()) {
+          return { lines: [], error: `[FILE NOT FOUND] ${params.path}` };
+        }
+      } catch (error) {
+        return {
+          lines: [],
+          error: `[READ ERROR] ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      try {
+        const lines = (await readFile(absTarget, "utf8")).split(/\r?\n/);
+        const start = Math.max(1, params.start ?? 1);
+        const end = Math.min(lines.length, params.end ?? lines.length);
+        const selected = lines
+          .slice(start - 1, end)
+          .map((line, index) => `${start + index}|${line}`);
+
+        return { lines: selected };
+      } catch (error) {
+        return {
+          lines: [],
+          error: `[READ ERROR] ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    },
+
+    async listDirectory(params) {
+      let root: string;
+      try {
+        root = resolveUnderRepo(absRoot, params.path || ".");
+      } catch {
+        return [];
+      }
+
+      const maxDepth = params.maxDepth ?? 3;
+      const maxResults = params.maxResults ?? 500;
+      const pattern = params.pattern ? new RegExp(params.pattern) : null;
+      const results: Array<{
+        name: string;
+        path: string;
+        type: "file" | "dir";
+        depth: number;
+      }> = [];
+
+      async function walk(dir: string, depth: number): Promise<void> {
+        if (depth > maxDepth || results.length >= maxResults) return;
+
+        let entries;
+        try {
+          entries = await readdir(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+
+        for (const entry of entries) {
+          if (results.length >= maxResults) return;
+          if (shouldSkipLocalSearchEntry(entry.name)) continue;
+          if (pattern && !pattern.test(entry.name)) continue;
+
+          const fullPath = joinPath(dir, entry.name);
+          const isDir = entry.isDirectory();
+          results.push({
+            name: entry.name,
+            path: toRepoRelative(absRoot, fullPath),
+            type: isDir ? "dir" : "file",
+            depth,
+          });
+
+          if (isDir) await walk(fullPath, depth + 1);
+        }
+      }
+
+      await walk(root, 0);
+      return results;
+    },
+
+    async glob(params) {
+      let searchDir: string;
+      try {
+        searchDir = params.path
+          ? resolveUnderRepo(absRoot, params.path)
+          : absRoot;
+      } catch (error) {
+        return {
+          files: [],
+          searchDir: absRoot,
+          totalFound: 0,
+          error: `[PATH ERROR] ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      const targetArg =
+        searchDir === absRoot ? "." : toRepoRelative(absRoot, searchDir);
+      const result = await runLocalRipgrep(
+        [
+          "--files",
+          "--color=never",
+          "-g",
+          params.pattern,
+          ...localSearchRipgrepExcludes(),
+          targetArg || ".",
+        ],
+        absRoot,
+      );
+
+      if (result.exitCode === -1) {
+        return {
+          files: [],
+          searchDir,
+          totalFound: 0,
+          error: `[RIPGREP NOT AVAILABLE] ${result.stderr}`,
+        };
+      }
+
+      const files = result.stdout
+        .trim()
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0)
+        .slice(0, 100);
+
+      return {
+        files,
+        searchDir,
+        totalFound: files.length,
+      };
+    },
+  };
 }
 
 function appendRuntimeNotes(description: string, notes: string[]): string {
@@ -841,7 +1246,7 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
 
           // Call Morph SDK to merge the edit
           const startTime = Date.now();
-          const result = await morph!.fastApply.applyEdit(
+          const result = await applyEdit(
             {
               originalCode,
               codeEdit: normalizedCodeEdit,
@@ -849,7 +1254,9 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
               filepath: target_filepath,
             },
             {
+              morphApiKey: MORPH_API_KEY,
               morphApiUrl: MORPH_API_URL,
+              timeout: MORPH_TIMEOUT,
               generateUdiff: true,
             },
           );
@@ -967,12 +1374,14 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           const startTime = Date.now();
 
           try {
+            const repoRoot = resolveSessionRepoRoot(
+              directory,
+              worktree,
+            );
             const generator = warpGrep!.execute({
               searchTerm: args.search_term,
-              repoRoot: resolveSessionRepoRoot(
-                directory,
-                worktree,
-              ),
+              repoRoot,
+              provider: createLocalWarpGrepProvider(repoRoot),
               streamSteps: true,
             });
 
