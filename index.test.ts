@@ -29,7 +29,10 @@ function normalizeCodeEditInput(codeEdit: string): string {
 async function importPluginWithEnv(
   env: Record<string, string | undefined>,
 ): Promise<{
-  default: (input: any) => Promise<Record<string, any>>;
+  default: (
+    input: any,
+    options?: Record<string, unknown>,
+  ) => Promise<Record<string, any>>;
 }> {
   const previous = new Map<string, string | undefined>();
 
@@ -50,11 +53,17 @@ async function importPluginWithEnv(
   }
 }
 
-function makePluginInput(directory: string, worktree = directory) {
+function makePluginInput(
+  directory: string,
+  worktree = directory,
+  logs: any[] = [],
+) {
   return {
     client: {
       app: {
-        log: async () => {},
+        log: async (entry: any) => {
+          logs.push(entry.body);
+        },
       },
     },
     project: {},
@@ -113,6 +122,7 @@ describe("packaged tool-selection instructions", () => {
     expect(content).toContain("warpgrep_codebase_search");
     expect(content).toContain("warpgrep_github_search");
     expect(content).toContain("MORPH_API_KEY");
+    expect(content).toContain('"apiKey"');
     expect(content).toContain("MORPH_COMPACT_TOKEN_LIMIT");
     expect(content).toContain("opencode.json");
   });
@@ -933,7 +943,7 @@ describe("plugin runtime hooks", () => {
 
     expect(output.description).toContain("Runtime notes:");
     expect(output.description).toContain(
-      "Currently unavailable until MORPH_API_KEY is configured.",
+      "Currently unavailable until a Morph API key is configured.",
     );
     expect(output.description).toContain(
       "Blocked in readonly agents: plan, explore.",
@@ -962,6 +972,60 @@ describe("plugin runtime hooks", () => {
       "Prefer morph_edit for large or scattered edits inside existing files.",
     );
     expect(combined).toContain("Use write for brand new files.");
+  });
+
+  test("apiKey plugin option enables morph tools without MORPH_API_KEY", async () => {
+    const { default: MorphPlugin } = await importPluginWithEnv({
+      MORPH_API_KEY: undefined,
+    });
+    const logs: any[] = [];
+
+    const hooks = await MorphPlugin(
+      makePluginInput("/tmp/morph-plugin", "/tmp/morph-plugin", logs),
+      { apiKey: "\n  morph-config-test-key  \n" },
+    );
+    const output = {
+      description: "Base description",
+      parameters: {},
+    };
+
+    await hooks["tool.definition"]?.({ toolID: "morph_edit" }, output);
+
+    expect(output.description).toContain("Runtime notes:");
+    expect(output.description).not.toContain("Currently unavailable");
+
+    const system = { system: [] as string[] };
+    await hooks["experimental.chat.system.transform"]?.(
+      {
+        sessionID: "session-test",
+        model: {},
+      },
+      system,
+    );
+
+    expect(system.system.join("\n")).toContain("Morph plugin routing hints:");
+    expect(JSON.stringify(logs)).not.toContain("morph-config-test-key");
+  });
+
+  test("blank apiKey plugin option falls back to MORPH_API_KEY", async () => {
+    const { default: MorphPlugin } = await importPluginWithEnv({
+      MORPH_API_KEY: "morph-env-test-key",
+    });
+
+    const hooks = await MorphPlugin(makePluginInput("/tmp/morph-plugin"), {
+      apiKey: "   ",
+    });
+    const output = { system: [] as string[] };
+
+    await hooks["experimental.chat.system.transform"]?.(
+      {
+        sessionID: "session-test",
+        model: {},
+      },
+      output,
+    );
+
+    expect(output.system.join("\n")).toContain("Morph plugin routing hints:");
   });
 });
 

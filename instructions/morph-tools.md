@@ -34,7 +34,7 @@ faster or more reliable than exact-string replacement.
 - The change is a small exact `oldString` -> `newString` replacement
 - You are creating a brand new file
 - The current agent is readonly and cannot edit files
-- `MORPH_API_KEY` is not configured; fall back to native `edit`
+- A Morph API key is not configured via plugin `apiKey` or `MORPH_API_KEY`; fall back to native `edit`
 
 ### WarpGrep Usage
 
