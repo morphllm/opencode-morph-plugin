@@ -9,7 +9,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CompactClient, WarpGrepClient } from "@morphllm/morphsdk";
+import { CompactClient } from "@morphllm/morphsdk/edge";
+import { WarpGrepClient } from "@morphllm/morphsdk/tools/warp-grep/client";
 
 // These are internal to the plugin but duplicated here for testing.
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -115,6 +116,21 @@ describe("packaged tool-selection instructions", () => {
     expect(content).toContain("MORPH_API_KEY");
     expect(content).toContain("MORPH_COMPACT_TOKEN_LIMIT");
     expect(content).toContain("opencode.json");
+  });
+});
+
+describe("MorphSDK loader compatibility", () => {
+  test("plugin source avoids MorphSDK aggregate runtime entrypoints", () => {
+    const content = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
+
+    expect(content).not.toMatch(/from\s+["']@morphllm\/morphsdk["']/);
+    expect(content).not.toMatch(
+      /from\s+["']@morphllm\/morphsdk\/tools\/warp-grep["']/,
+    );
+    expect(content).toContain('from "@morphllm/morphsdk/edge"');
+    expect(content).toContain(
+      'from "@morphllm/morphsdk/tools/warp-grep/client"',
+    );
   });
 });
 

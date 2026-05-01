@@ -2,14 +2,15 @@
  * OpenCode Morph Plugin v2
  *
  * Integrates Morph SDK for fast apply, WarpGrep codebase search, and shell env.
- * Uses MorphClient for shared config (API key, timeout, retries) across all tools.
+ * Uses narrowly scoped Morph SDK entrypoints so opencode can load the plugin
+ * without evaluating SDK adapters that are not needed by this plugin.
  *
  * @see https://docs.morphllm.com/quickstart
  */
 
 import { type Plugin, tool } from "@opencode-ai/plugin";
-import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
-import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
+import { applyEdit, CompactClient } from "@morphllm/morphsdk/edge";
+import { WarpGrepClient } from "@morphllm/morphsdk/tools/warp-grep/client";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 
@@ -74,16 +75,27 @@ const PLUGIN_VERSION = "2.0.0";
 const EXISTING_CODE_MARKER = "// ... existing code ...";
 const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
 
-/**
- * Shared MorphClient — FastApply uses morph.fastApply.applyEdit()
- * with MORPH_API_URL passed as per-call override.
- */
-const morph = MORPH_API_KEY
-  ? new MorphClient({
-      apiKey: MORPH_API_KEY,
-      timeout: MORPH_TIMEOUT,
-    })
-  : null;
+type WarpGrepResult = {
+  success: boolean;
+  error?: string | null;
+  contexts?: Array<{
+    file: string;
+    content: string;
+    lines?: "*" | Array<[number, number]>;
+  }>;
+};
+
+type CompactResult = {
+  output: string;
+  messages: Array<{
+    role: string;
+    content: string;
+  }>;
+  usage: {
+    compression_ratio: number;
+    processing_time_ms: number;
+  };
+};
 
 /**
  * Separate WarpGrep client with its own timeout (typically longer than fast apply).
@@ -841,7 +853,7 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
 
           // Call Morph SDK to merge the edit
           const startTime = Date.now();
-          const result = await morph!.fastApply.applyEdit(
+          const result = await applyEdit(
             {
               originalCode,
               codeEdit: normalizedCodeEdit,
@@ -849,7 +861,9 @@ If you truly want to replace the entire file, use the 'write' tool instead.`;
               filepath: target_filepath,
             },
             {
+              morphApiKey: MORPH_API_KEY,
               morphApiUrl: MORPH_API_URL,
+              timeout: MORPH_TIMEOUT,
               generateUdiff: true,
             },
           );
