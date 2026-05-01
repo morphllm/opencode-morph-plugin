@@ -60,20 +60,20 @@ You should see `morph_edit`, `warpgrep_codebase_search`, and `warpgrep_github_se
 
 ## Compaction
 
-Context compression via the Morph Compact API. Runs automatically before each LLM call when the conversation exceeds a token threshold.
+Context compression via the Morph Compact API. In current OpenCode 1.14.x releases, only OpenCode native compaction writes the persisted summary message that future turns and the sidebar use. This plugin handles that path by pre-compressing the selected history with Morph before OpenCode's native compaction model writes its summary.
 
 ### How it works
 
-1. Before each LLM call, the plugin estimates the total characters in the conversation
-2. If the estimate exceeds the threshold, older messages are compressed via the Morph Compact API (~250ms)
-3. The compressed result is cached ("frozen") and reused on subsequent calls for prompt cache stability
-4. Only the most recent user message is kept uncompacted
+1. When OpenCode native compaction starts, the plugin adds Morph-aware instructions to the compaction prompt
+2. The following `experimental.chat.messages.transform` hook receives the history OpenCode selected for compaction
+3. Morph compresses that selected history to one summary message before OpenCode sends it to the compaction model
+4. OpenCode then persists its normal compaction summary and emits `session.compacted`
 
-The LLM receives compressed history + your latest prompt. The "Context: X tokens" number in the sidebar reflects the actual tokens sent (post-compaction).
+The Morph toast means the compaction input was compressed for OpenCode. Seeing OpenCode native compaction immediately after the toast is expected; that is the mechanism that persists the summary. The "Context: X tokens" number in the sidebar is based on OpenCode's stored assistant token usage, so it updates after OpenCode finishes compaction and/or after the next assistant response, not at the instant the Morph toast appears.
 
 ### Configuring the compaction threshold
 
-By default, compaction triggers at **70% of the model's context window**. You can override this with a fixed token limit:
+For non-native transform calls, the plugin uses a default threshold of **70% of the model's context window**. With a 1M token model, that is roughly 700k estimated tokens. You can override this with a fixed token limit:
 
 ```bash
 # Compact when conversation exceeds 20,000 tokens
@@ -97,13 +97,19 @@ grep "service=morph" ~/.local/share/opencode/log/*.log | grep -i compact
 When compaction fires, you'll see entries like:
 
 ```
-INFO service=morph First compaction: 2 messages (30137 chars), keeping 1 recent. Threshold crossed: 30178 >= 15000
-INFO service=morph Compact: 2 messages -> 2 frozen (15142 chars). Messages: 3 -> 3. Ratio: 45% kept (244ms)
+INFO service=morph OpenCode native compaction triggered; Morph will pre-compress selected history and OpenCode will persist the summary.
+INFO service=morph Native compaction: compressing 42 selected messages (210137 chars) before OpenCode writes its persisted summary.
+INFO service=morph Native compaction: Morph compressed 42 messages -> 1 summary (15142 chars). Ratio: 20% kept (244ms)
+INFO service=morph OpenCode native compaction completed; cleared Morph transient compaction state.
 ```
 
-You'll also see a toast notification in the OpenCode UI when compaction triggers.
+You'll also see a toast notification in the OpenCode UI:
 
-On subsequent LLM calls (before re-compaction is needed), you'll see:
+```
+Prepared OpenCode compaction with Morph (20% kept) | 244ms
+```
+
+If OpenCode native compaction is not involved and a future OpenCode version calls `experimental.chat.messages.transform` before normal LLM turns, the plugin still has the older proactive path. In that path, subsequent LLM calls can show:
 
 ```
 INFO service=morph Under threshold - reusing frozen block. Messages: 5 -> 5
