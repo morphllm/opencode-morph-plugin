@@ -131,6 +131,8 @@ describe("MorphSDK loader compatibility", () => {
     expect(content).toContain(
       'from "@morphllm/morphsdk/tools/warp-grep/client"',
     );
+    expect(content).toContain("createLocalWarpGrepProvider(repoRoot)");
+    expect(content).not.toContain("LocalRipgrepProvider");
   });
 });
 
