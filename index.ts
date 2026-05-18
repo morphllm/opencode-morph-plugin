@@ -68,7 +68,7 @@ const ALLOW_READONLY_AGENTS =
   process.env.MORPH_ALLOW_READONLY_AGENTS === "true";
 
 /** Plugin version */
-const PLUGIN_VERSION = "2.0.0";
+const PLUGIN_VERSION = "2.0.0-rate-reasoning-patch";
 
 /** Canonical marker string used for lazy edit placeholders */
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -173,7 +173,11 @@ function serializePart(part: Part): string {
       return `[Tool: ${tp.tool}] ${state.status}`;
     }
     case "reasoning":
-      return `[Reasoning] ${(part as { text: string }).text}`;
+      // PATCH (rate-reasoning): drop reasoning from compaction input.
+      // Stale reasoning is the LLM's prior internal monologue — not worth
+      // summarizing into the frozen block. Trigger threshold still counts
+      // reasoning bytes (see estimateTotalChars).
+      return "";
     default:
       return `[${part.type}]`;
   }
@@ -188,7 +192,10 @@ function messagesToCompactInput(
   return messages
     .map((m) => ({
       role: m.info.role,
-      content: m.parts.map(serializePart).join("\n"),
+      content: m.parts
+        .map(serializePart)
+        .filter((s) => s.length > 0)
+        .join("\n"),
     }))
     .filter((m) => m.content.length > 0);
 }
@@ -203,14 +210,19 @@ function estimateTotalChars(
   for (const m of messages) {
     for (const part of m.parts) {
       if (part.type === "text") total += (part as TextPart).text.length;
-      else if (part.type === "tool") {
+      else if (part.type === "reasoning") {
+        // PATCH (rate-reasoning): include reasoning in trigger calculation.
+        // Reasoning eats prompt budget on the wire; the trigger threshold
+        // must see it even though it's stripped at compaction time.
+        total += (part as { text?: string }).text?.length ?? 0;
+      } else if (part.type === "tool") {
         const tp = part as ToolPart;
         if (tp.state.status === "completed") {
           total += (tp.state.output || "").length;
           total += JSON.stringify(tp.state.input).length;
         }
-      }
     }
+  }
   }
   return total;
 }
