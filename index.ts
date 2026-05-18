@@ -68,7 +68,7 @@ const ALLOW_READONLY_AGENTS =
   process.env.MORPH_ALLOW_READONLY_AGENTS === "true";
 
 /** Plugin version */
-const PLUGIN_VERSION = "2.0.1-rate-slash-compact";
+const PLUGIN_VERSION = "2.0.2-rate-slash-compact-silent";
 
 /**
  * Slash command pattern for manual compaction trigger.
@@ -1253,19 +1253,42 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
   if (MORPH_COMPACT_ENABLED) {
     // Slash command: detect `/morph compact` in the latest user message,
-    // strip it, and arm the force-compact flag for the next transform.
+    // strip it, arm force-compact flag, and rewrite the user text so the LLM
+    // treats this turn as a no-op (don't write a summary or any reply).
     hooks["chat.message"] = async (_input: any, output: any) => {
       if (!Array.isArray(output?.parts)) return;
       let triggered = false;
-      for (const part of output.parts) {
+      let stripIndex = -1;
+      for (let i = 0; i < output.parts.length; i++) {
+        const part = output.parts[i];
         if (part?.type !== "text" || typeof part.text !== "string") continue;
         if (!MORPH_COMPACT_COMMAND_RE.test(part.text)) continue;
         triggered = true;
-        // Strip the command line; keep any remaining text on subsequent lines.
         const rest = part.text.replace(MORPH_COMPACT_COMMAND_RE, "").trimStart();
-        part.text = rest.length > 0
-          ? rest
-          : "[/morph compact — manual compaction requested]";
+        if (rest.length > 0) {
+          // Preserve any extra user text typed after the command on later lines.
+          part.text = rest;
+        } else {
+          // Mark for removal — keep silent placeholder only if removing would
+          // leave zero text parts (some backends choke on empty user turns).
+          stripIndex = i;
+        }
+      }
+      if (triggered && stripIndex >= 0) {
+        const otherTextParts = output.parts.filter(
+          (p: any, i: number) =>
+            i !== stripIndex && p?.type === "text" && typeof p.text === "string" && p.text.trim().length > 0,
+        );
+        if (otherTextParts.length > 0) {
+          // Other text exists — drop the command part entirely.
+          output.parts.splice(stripIndex, 1);
+        } else {
+          // No other text — leave a silent placeholder that explicitly tells the
+          // LLM not to respond. Phrased as a system-style internal directive so
+          // the model treats it as a no-op rather than a "summarize" instruction.
+          output.parts[stripIndex].text =
+            "[internal: Morph compaction triggered in background. This is not a request; do not respond.]";
+        }
       }
       if (triggered) {
         forceCompactOnNextTransform = true;
