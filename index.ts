@@ -68,7 +68,7 @@ const ALLOW_READONLY_AGENTS =
   process.env.MORPH_ALLOW_READONLY_AGENTS === "true";
 
 /** Plugin version */
-const PLUGIN_VERSION = "2.0.2-rate-slash-compact-silent";
+const PLUGIN_VERSION = "2.0.3-rate-inplace-mutation";
 
 /**
  * Slash command pattern for manual compaction trigger.
@@ -218,6 +218,36 @@ function messagesToCompactInput(
 /**
  * Estimate total character count across all message parts.
  */
+/**
+ * Replace the contents of opencode's messages array in place.
+ *
+ * CRITICAL: opencode's prompt.ts:1566 calls
+ *   plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+ * and then reads `msgs` directly afterwards — it ignores the trigger's return
+ * value. The hook receives `output = { messages: msgs }` (same array reference).
+ *
+ * If we reassign `output.messages = newArray`, we break the reference and
+ * opencode still sees the original unchanged `msgs`. Compaction silently no-ops:
+ * Morph's char count goes down on paper but the LLM keeps receiving the full
+ * conversation, with cache.read tokens staying flat across "compactions".
+ *
+ * We must mutate the original array in place. `splice` with a fresh spread is
+ * the cleanest single-statement form; for very large `next` arrays Node's
+ * argument stack can blow up, so we fall back to a loop above a safety limit.
+ */
+function replaceMessages(
+  output: { messages: { info: Message; parts: Part[] }[] },
+  next: { info: Message; parts: Part[] }[],
+): void {
+  const SPLICE_SAFE_LIMIT = 50_000;
+  if (next.length <= SPLICE_SAFE_LIMIT) {
+    output.messages.splice(0, output.messages.length, ...next);
+    return;
+  }
+  output.messages.length = 0;
+  for (const m of next) output.messages.push(m);
+}
+
 function estimateTotalChars(
   messages: { info: Message; parts: Part[] }[],
 ): number {
@@ -1349,7 +1379,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         if (effectiveChars < charThreshold && !forceCompact) {
           // Under threshold — reuse frozen block as-is (stable prefix = cache hit)
           const before = messages.length;
-          output.messages = [...compactionState.frozenMessages, ...uncompacted];
+          replaceMessages(output, [...compactionState.frozenMessages, ...uncompacted]);
           await log(
             "debug",
             `Under threshold — reusing frozen block. Messages: ${before} → ${output.messages.length}`,
@@ -1387,7 +1417,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
             frozenChars,
           };
           const beforeLen = messages.length;
-          output.messages = [...frozen, ...recent];
+          replaceMessages(output, [...frozen, ...recent]);
 
           await log(
             "info",
@@ -1399,7 +1429,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           );
         } catch (err) {
           // On failure, use stale frozen block + uncompacted as best-effort
-          output.messages = [...compactionState.frozenMessages, ...uncompacted];
+          replaceMessages(output, [...compactionState.frozenMessages, ...uncompacted]);
           await log(
             "warn",
             `Compact (re) failed: ${(err as Error).message}. Using stale frozen block.`,
@@ -1447,7 +1477,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           frozenChars,
         };
         const beforeLen = messages.length;
-        output.messages = [...frozen, ...recent];
+        replaceMessages(output, [...frozen, ...recent]);
 
         //Compact done: ${toCompact.length} msgs → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}`);
         await log(
