@@ -68,7 +68,14 @@ const ALLOW_READONLY_AGENTS =
   process.env.MORPH_ALLOW_READONLY_AGENTS === "true";
 
 /** Plugin version */
-const PLUGIN_VERSION = "2.0.0-rate-reasoning-patch";
+const PLUGIN_VERSION = "2.0.1-rate-slash-compact";
+
+/**
+ * Slash command pattern for manual compaction trigger.
+ * Matches `/morph compact`, `/morph-compact`, `/morph_compact` (case-insensitive)
+ * at the start of a user message, optionally followed by extra args (ignored).
+ */
+const MORPH_COMPACT_COMMAND_RE = /^\s*\/morph[\s_-]+compact\b.*$/i;
 
 /** Canonical marker string used for lazy edit placeholders */
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -126,6 +133,14 @@ let compactionState: {
   compactedUpToIndex: number;
   frozenChars: number;
 } | null = null;
+
+/**
+ * When true, the next experimental.chat.messages.transform invocation will
+ * bypass the normal char-threshold check and force a compaction. Set by the
+ * /morph compact slash command (chat.message hook). Cleared after the next
+ * transform attempt, regardless of success/failure.
+ */
+let forceCompactOnNextTransform = false;
 
 /**
  * Normalize code_edit input from LLM tool calls.
@@ -1237,6 +1252,28 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
   };
 
   if (MORPH_COMPACT_ENABLED) {
+    // Slash command: detect `/morph compact` in the latest user message,
+    // strip it, and arm the force-compact flag for the next transform.
+    hooks["chat.message"] = async (_input: any, output: any) => {
+      if (!Array.isArray(output?.parts)) return;
+      let triggered = false;
+      for (const part of output.parts) {
+        if (part?.type !== "text" || typeof part.text !== "string") continue;
+        if (!MORPH_COMPACT_COMMAND_RE.test(part.text)) continue;
+        triggered = true;
+        // Strip the command line; keep any remaining text on subsequent lines.
+        const rest = part.text.replace(MORPH_COMPACT_COMMAND_RE, "").trimStart();
+        part.text = rest.length > 0
+          ? rest
+          : "[/morph compact — manual compaction requested]";
+      }
+      if (triggered) {
+        forceCompactOnNextTransform = true;
+        await log("info", "Slash command /morph compact detected — forcing compaction on next LLM call.");
+        await showToast("info", "Morph: manual compaction armed for next turn");
+      }
+    };
+
     // Capture model context window from chat.params (fires every LLM call)
     hooks["chat.params"] = async (input: any) => {
       //chat.params CALLED: model=${input.model?.id}, context=${input.model?.limit?.context}`);
@@ -1253,6 +1290,8 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       if (!MORPH_API_KEY) return;
 
       const messages = output.messages;
+      const forceCompact = forceCompactOnNextTransform;
+      forceCompactOnNextTransform = false;
 
       // Approximate char threshold — fixed token limit takes precedence
       const charThreshold = COMPACT_TOKEN_LIMIT
@@ -1264,7 +1303,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       await log(
         "debug",
-        `messages.transform: ${messages.length} msgs, ${totalChars} chars (~${estTokens} tokens), threshold=${charThreshold} chars (~${Math.round(charThreshold / CHARS_PER_TOKEN)} tokens), hasFrozen=${!!compactionState}, tokenLimit=${COMPACT_TOKEN_LIMIT ?? "auto"}, modelCtx=${modelContextTokens}`,
+        `messages.transform: ${messages.length} msgs, ${totalChars} chars (~${estTokens} tokens), threshold=${charThreshold} chars (~${Math.round(charThreshold / CHARS_PER_TOKEN)} tokens), hasFrozen=${!!compactionState}, tokenLimit=${COMPACT_TOKEN_LIMIT ?? "auto"}, modelCtx=${modelContextTokens}, force=${forceCompact}`,
       );
 
       // Need at least preserve + 1 messages (something to compact + preserved recent)
@@ -1284,7 +1323,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           `Re-compact check: frozenChars=${compactionState.frozenChars}, uncompacted=${uncompacted.length} msgs (${estimateTotalChars(uncompacted)} chars), effective=${effectiveChars}, threshold=${charThreshold}`,
         );
 
-        if (effectiveChars < charThreshold) {
+        if (effectiveChars < charThreshold && !forceCompact) {
           // Under threshold — reuse frozen block as-is (stable prefix = cache hit)
           const before = messages.length;
           output.messages = [...compactionState.frozenMessages, ...uncompacted];
@@ -1348,7 +1387,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       // No frozen block yet — check if first compaction is needed
       //First compact check: totalChars=${totalChars}, charThreshold=${charThreshold}, over=${totalChars >= charThreshold}`);
-      if (totalChars < charThreshold) {
+      if (totalChars < charThreshold && !forceCompact) {
         //Under threshold (${totalChars} < ${charThreshold}), skipping`);
         return;
       }
