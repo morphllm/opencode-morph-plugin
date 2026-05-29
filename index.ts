@@ -68,7 +68,14 @@ const ALLOW_READONLY_AGENTS =
   process.env.MORPH_ALLOW_READONLY_AGENTS === "true";
 
 /** Plugin version */
-const PLUGIN_VERSION = "2.0.0";
+const PLUGIN_VERSION = "2.0.4-rate-per-session-state";
+
+/**
+ * Slash command pattern for manual compaction trigger.
+ * Matches `/morph compact`, `/morph-compact`, `/morph_compact` (case-insensitive)
+ * at the start of a user message, optionally followed by extra args (ignored).
+ */
+const MORPH_COMPACT_COMMAND_RE = /^\s*\/morph[\s_-]+compact\b.*$/i;
 
 /** Canonical marker string used for lazy edit placeholders */
 const EXISTING_CODE_MARKER = "// ... existing code ...";
@@ -114,18 +121,60 @@ const compactClient = MORPH_API_KEY
 let modelContextTokens = 200_000;
 
 /**
- * Frozen compaction state. Once messages are compacted, the result is
- * frozen and reused identically on every subsequent messages.transform call.
+ * Frozen compaction state, PER SESSION.
+ *
+ * Each session owns its own frozen block. CRITICAL: when a parent session
+ * spawns a subagent via the `task` tool, the subagent runs as an independent
+ * session with its own messages array and its own (likely empty) compaction
+ * history. Before this map existed (v2.0.3 and earlier), `compactionState`
+ * was a single module-level let — once the parent compacted, every later
+ * LLM call in the same trial process (parent retries AND subagent first
+ * calls) hit the same global, so subagents had their tiny messages array
+ * "rehydrated" with the parent's frozen block. Result: subagents answered
+ * the topic captured in the parent's frozen block instead of their own
+ * prompt. Per-session keying eliminates that cross-talk.
+ *
+ * Once a session's messages are compacted, the result is frozen and reused
+ * identically on every subsequent messages.transform call for THAT session.
  * This preserves prompt cache stability (the prefix bytes never change).
  *
  * On re-compaction, the old frozen block is discarded entirely and a new
  * one is built from only the uncompacted messages (never double-compact).
  */
-let compactionState: {
+type CompactionState = {
   frozenMessages: { info: Message; parts: Part[] }[];
   compactedUpToIndex: number;
   frozenChars: number;
-} | null = null;
+};
+const compactionStateBySession = new Map<string, CompactionState>();
+
+/**
+ * When set, the next experimental.chat.messages.transform invocation for
+ * that session will bypass the normal char-threshold check and force a
+ * compaction. Set by the /morph compact slash command (chat.message hook).
+ * Cleared after the next transform attempt, regardless of success/failure.
+ *
+ * Per-session for the same reason as compactionStateBySession above —
+ * a `/morph compact` typed into the parent session must not force the next
+ * subagent's first LLM call into a useless compaction attempt.
+ */
+const forceCompactBySession = new Map<string, true>();
+
+/**
+ * Extract sessionID from the transform hook's `output.messages` argument.
+ *
+ * The plugin API does not pass sessionID into experimental.chat.messages.transform
+ * (input is `{}`). Fortunately every SDK Message carries its own sessionID
+ * field, so we read it off the first message. Returns null when the array
+ * is empty (nothing to compact anyway).
+ */
+function sessionIDFromMessages(
+  messages: { info: Message; parts: Part[] }[],
+): string | null {
+  const first = messages[0];
+  if (!first) return null;
+  return (first.info as { sessionID?: string }).sessionID ?? null;
+}
 
 /**
  * Normalize code_edit input from LLM tool calls.
@@ -173,7 +222,11 @@ function serializePart(part: Part): string {
       return `[Tool: ${tp.tool}] ${state.status}`;
     }
     case "reasoning":
-      return `[Reasoning] ${(part as { text: string }).text}`;
+      // PATCH (rate-reasoning): drop reasoning from compaction input.
+      // Stale reasoning is the LLM's prior internal monologue — not worth
+      // summarizing into the frozen block. Trigger threshold still counts
+      // reasoning bytes (see estimateTotalChars).
+      return "";
     default:
       return `[${part.type}]`;
   }
@@ -188,7 +241,10 @@ function messagesToCompactInput(
   return messages
     .map((m) => ({
       role: m.info.role,
-      content: m.parts.map(serializePart).join("\n"),
+      content: m.parts
+        .map(serializePart)
+        .filter((s) => s.length > 0)
+        .join("\n"),
     }))
     .filter((m) => m.content.length > 0);
 }
@@ -196,6 +252,36 @@ function messagesToCompactInput(
 /**
  * Estimate total character count across all message parts.
  */
+/**
+ * Replace the contents of opencode's messages array in place.
+ *
+ * CRITICAL: opencode's prompt.ts:1566 calls
+ *   plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+ * and then reads `msgs` directly afterwards — it ignores the trigger's return
+ * value. The hook receives `output = { messages: msgs }` (same array reference).
+ *
+ * If we reassign `output.messages = newArray`, we break the reference and
+ * opencode still sees the original unchanged `msgs`. Compaction silently no-ops:
+ * Morph's char count goes down on paper but the LLM keeps receiving the full
+ * conversation, with cache.read tokens staying flat across "compactions".
+ *
+ * We must mutate the original array in place. `splice` with a fresh spread is
+ * the cleanest single-statement form; for very large `next` arrays Node's
+ * argument stack can blow up, so we fall back to a loop above a safety limit.
+ */
+function replaceMessages(
+  output: { messages: { info: Message; parts: Part[] }[] },
+  next: { info: Message; parts: Part[] }[],
+): void {
+  const SPLICE_SAFE_LIMIT = 50_000;
+  if (next.length <= SPLICE_SAFE_LIMIT) {
+    output.messages.splice(0, output.messages.length, ...next);
+    return;
+  }
+  output.messages.length = 0;
+  for (const m of next) output.messages.push(m);
+}
+
 function estimateTotalChars(
   messages: { info: Message; parts: Part[] }[],
 ): number {
@@ -203,14 +289,19 @@ function estimateTotalChars(
   for (const m of messages) {
     for (const part of m.parts) {
       if (part.type === "text") total += (part as TextPart).text.length;
-      else if (part.type === "tool") {
+      else if (part.type === "reasoning") {
+        // PATCH (rate-reasoning): include reasoning in trigger calculation.
+        // Reasoning eats prompt budget on the wire; the trigger threshold
+        // must see it even though it's stripped at compaction time.
+        total += (part as { text?: string }).text?.length ?? 0;
+      } else if (part.type === "tool") {
         const tp = part as ToolPart;
         if (tp.state.status === "completed") {
           total += (tp.state.output || "").length;
           total += JSON.stringify(tp.state.input).length;
         }
-      }
     }
+  }
   }
   return total;
 }
@@ -1225,6 +1316,59 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
   };
 
   if (MORPH_COMPACT_ENABLED) {
+    // Slash command: detect `/morph compact` in the latest user message,
+    // strip it, arm force-compact flag, and rewrite the user text so the LLM
+    // treats this turn as a no-op (don't write a summary or any reply).
+    hooks["chat.message"] = async (input: any, output: any) => {
+      if (!Array.isArray(output?.parts)) return;
+      let triggered = false;
+      let stripIndex = -1;
+      for (let i = 0; i < output.parts.length; i++) {
+        const part = output.parts[i];
+        if (part?.type !== "text" || typeof part.text !== "string") continue;
+        if (!MORPH_COMPACT_COMMAND_RE.test(part.text)) continue;
+        triggered = true;
+        const rest = part.text.replace(MORPH_COMPACT_COMMAND_RE, "").trimStart();
+        if (rest.length > 0) {
+          // Preserve any extra user text typed after the command on later lines.
+          part.text = rest;
+        } else {
+          // Mark for removal — keep silent placeholder only if removing would
+          // leave zero text parts (some backends choke on empty user turns).
+          stripIndex = i;
+        }
+      }
+      if (triggered && stripIndex >= 0) {
+        const otherTextParts = output.parts.filter(
+          (p: any, i: number) =>
+            i !== stripIndex && p?.type === "text" && typeof p.text === "string" && p.text.trim().length > 0,
+        );
+        if (otherTextParts.length > 0) {
+          // Other text exists — drop the command part entirely.
+          output.parts.splice(stripIndex, 1);
+        } else {
+          // No other text — leave a silent placeholder that explicitly tells the
+          // LLM not to respond. Phrased as a system-style internal directive so
+          // the model treats it as a no-op rather than a "summarize" instruction.
+          output.parts[stripIndex].text =
+            "[internal: Morph compaction triggered in background. This is not a request; do not respond.]";
+        }
+      }
+      if (triggered) {
+        // Arm the force-compact flag for THIS session only. Subagents must
+        // not be forced into compaction by a /morph compact typed in the
+        // parent session.
+        const sid = typeof input?.sessionID === "string" ? input.sessionID : null;
+        if (sid) {
+          forceCompactBySession.set(sid, true);
+          await log("info", `Slash command /morph compact detected — forcing compaction on next LLM call (session ${sid}).`);
+        } else {
+          await log("warn", "Slash command /morph compact detected but no sessionID in chat.message input; force flag NOT armed.");
+        }
+        await showToast("info", "Morph: manual compaction armed for next turn");
+      }
+    };
+
     // Capture model context window from chat.params (fires every LLM call)
     hooks["chat.params"] = async (input: any) => {
       //chat.params CALLED: model=${input.model?.id}, context=${input.model?.limit?.context}`);
@@ -1242,6 +1386,16 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       const messages = output.messages;
 
+      // Resolve current session FIRST. Without a sessionID we cannot safely
+      // touch compactionStateBySession, so we degrade to "do nothing" — that
+      // is strictly better than reading another session's state.
+      const sessionID = sessionIDFromMessages(messages);
+      if (!sessionID) return;
+
+      const compactionState = compactionStateBySession.get(sessionID) ?? null;
+      const forceCompact = forceCompactBySession.has(sessionID);
+      if (forceCompact) forceCompactBySession.delete(sessionID);
+
       // Approximate char threshold — fixed token limit takes precedence
       const charThreshold = COMPACT_TOKEN_LIMIT
         ? COMPACT_TOKEN_LIMIT * CHARS_PER_TOKEN
@@ -1252,7 +1406,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       await log(
         "debug",
-        `messages.transform: ${messages.length} msgs, ${totalChars} chars (~${estTokens} tokens), threshold=${charThreshold} chars (~${Math.round(charThreshold / CHARS_PER_TOKEN)} tokens), hasFrozen=${!!compactionState}, tokenLimit=${COMPACT_TOKEN_LIMIT ?? "auto"}, modelCtx=${modelContextTokens}`,
+        `messages.transform: session=${sessionID} ${messages.length} msgs, ${totalChars} chars (~${estTokens} tokens), threshold=${charThreshold} chars (~${Math.round(charThreshold / CHARS_PER_TOKEN)} tokens), hasFrozen=${!!compactionState}, tokenLimit=${COMPACT_TOKEN_LIMIT ?? "auto"}, modelCtx=${modelContextTokens}, force=${forceCompact}`,
       );
 
       // Need at least preserve + 1 messages (something to compact + preserved recent)
@@ -1272,10 +1426,10 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           `Re-compact check: frozenChars=${compactionState.frozenChars}, uncompacted=${uncompacted.length} msgs (${estimateTotalChars(uncompacted)} chars), effective=${effectiveChars}, threshold=${charThreshold}`,
         );
 
-        if (effectiveChars < charThreshold) {
+        if (effectiveChars < charThreshold && !forceCompact) {
           // Under threshold — reuse frozen block as-is (stable prefix = cache hit)
           const before = messages.length;
-          output.messages = [...compactionState.frozenMessages, ...uncompacted];
+          replaceMessages(output, [...compactionState.frozenMessages, ...uncompacted]);
           await log(
             "debug",
             `Under threshold — reusing frozen block. Messages: ${before} → ${output.messages.length}`,
@@ -1307,17 +1461,17 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
           const frozen = buildCompactedMessages(toCompact, result);
           const frozenChars = estimateTotalChars(frozen);
-          compactionState = {
+          compactionStateBySession.set(sessionID, {
             frozenMessages: frozen,
             compactedUpToIndex: messages.length - recent.length,
             frozenChars,
-          };
+          });
           const beforeLen = messages.length;
-          output.messages = [...frozen, ...recent];
+          replaceMessages(output, [...frozen, ...recent]);
 
           await log(
             "info",
-            `Compact (re): ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+            `Compact (re): session=${sessionID} ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
           );
           await showToast(
             "success",
@@ -1325,7 +1479,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
           );
         } catch (err) {
           // On failure, use stale frozen block + uncompacted as best-effort
-          output.messages = [...compactionState.frozenMessages, ...uncompacted];
+          replaceMessages(output, [...compactionState.frozenMessages, ...uncompacted]);
           await log(
             "warn",
             `Compact (re) failed: ${(err as Error).message}. Using stale frozen block.`,
@@ -1336,7 +1490,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
       // No frozen block yet — check if first compaction is needed
       //First compact check: totalChars=${totalChars}, charThreshold=${charThreshold}, over=${totalChars >= charThreshold}`);
-      if (totalChars < charThreshold) {
+      if (totalChars < charThreshold && !forceCompact) {
         //Under threshold (${totalChars} < ${charThreshold}), skipping`);
         return;
       }
@@ -1354,7 +1508,7 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       //compactInput: ${compactInput.length} messages, total chars=${compactInput.reduce((a, m) => a + m.content.length, 0)}`);
       if (compactInput.length === 0) return;
 
-      await log("info", `First compaction: ${toCompact.length} messages (${estimateTotalChars(toCompact)} chars), keeping ${recent.length} recent. Threshold crossed: ${totalChars} >= ${charThreshold}`);
+      await log("info", `First compaction: session=${sessionID} ${toCompact.length} messages (${estimateTotalChars(toCompact)} chars), keeping ${recent.length} recent. Threshold crossed: ${totalChars} >= ${charThreshold}`);
 
       try {
         //Calling compactClient.compact() with ${compactInput.length} messages, ratio=${COMPACT_RATIO}...`);
@@ -1367,18 +1521,18 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
         const frozen = buildCompactedMessages(toCompact, result);
         const frozenChars = estimateTotalChars(frozen);
-        compactionState = {
+        compactionStateBySession.set(sessionID, {
           frozenMessages: frozen,
           compactedUpToIndex: messages.length - recent.length,
           frozenChars,
-        };
+        });
         const beforeLen = messages.length;
-        output.messages = [...frozen, ...recent];
+        replaceMessages(output, [...frozen, ...recent]);
 
         //Compact done: ${toCompact.length} msgs → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}`);
         await log(
           "info",
-          `Compact: ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+          `Compact: session=${sessionID} ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
         );
         await showToast(
           "success",
