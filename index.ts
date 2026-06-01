@@ -127,6 +127,24 @@ let compactionState: {
   frozenChars: number;
 } | null = null;
 
+const NATIVE_COMPACTION_ARM_TTL_MS = 30_000;
+const nativeCompactionArms: number[] = [];
+
+function armNativeCompaction() {
+  nativeCompactionArms.push(Date.now());
+}
+
+function consumeNativeCompactionArm(): boolean {
+  const now = Date.now();
+
+  while (nativeCompactionArms.length > 0) {
+    const armedAt = nativeCompactionArms.shift()!;
+    if (now - armedAt <= NATIVE_COMPACTION_ARM_TTL_MS) return true;
+  }
+
+  return false;
+}
+
 /**
  * Normalize code_edit input from LLM tool calls.
  *
@@ -215,6 +233,47 @@ function estimateTotalChars(
   return total;
 }
 
+function formatCompressionPercent(result: CompactResult): number {
+  return Math.round(result.usage.compression_ratio * 100);
+}
+
+function compactResultText(result: CompactResult): string {
+  const output = result.output?.trim();
+  if (output) return output;
+
+  return result.messages
+    .map((message) => `[${message.role}] ${message.content}`)
+    .join("\n\n")
+    .trim();
+}
+
+function buildCompactedSummaryMessages(
+  originalMessages: { info: Message; parts: Part[] }[],
+  result: CompactResult,
+): { info: Message; parts: Part[] }[] {
+  if (originalMessages.length === 0) return [];
+
+  const template = originalMessages[0]!;
+  const last = originalMessages[originalMessages.length - 1]!;
+  const summary = compactResultText(result);
+
+  if (!summary) return [];
+
+  return [
+    {
+      info: { ...template.info } as Message,
+      parts: [
+        {
+          id: `morph-compact-summary-${template.info.id}-${last.info.id}`,
+          sessionID: template.info.sessionID,
+          messageID: template.info.id,
+          type: "text" as const,
+          text: `Morph-compressed conversation history:\n\n${summary}`,
+        } as TextPart,
+      ],
+    },
+  ];
+}
 
 function resolveSessionFilepath(
   targetFilepath: string,
@@ -1225,6 +1284,17 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
   };
 
   if (MORPH_COMPACT_ENABLED) {
+    hooks.event = async ({ event }: any) => {
+      if (event.type !== "session.compacted") return;
+
+      compactionState = null;
+      nativeCompactionArms.length = 0;
+      await log(
+        "info",
+        "OpenCode native compaction completed; cleared Morph transient compaction state.",
+      );
+    };
+
     // Capture model context window from chat.params (fires every LLM call)
     hooks["chat.params"] = async (input: any) => {
       //chat.params CALLED: model=${input.model?.id}, context=${input.model?.limit?.context}`);
@@ -1233,14 +1303,68 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       }
     };
 
-    // Compaction: compress older messages via Morph, then FREEZE the result.
-    // The frozen block is reused byte-for-byte on every subsequent call,
-    // preserving the LLM provider's prompt prefix cache.
-    // Re-compaction only fires when the threshold is crossed again.
+    // Compaction: current OpenCode calls this during native session compaction.
+    // When armed by experimental.session.compacting, Morph reduces the selected
+    // history to a single summary before OpenCode writes its persisted summary.
+    // The fallback path below preserves the older proactive/frozen behavior for
+    // OpenCode versions that call this hook before normal LLM turns.
     hooks["experimental.chat.messages.transform"] = async (_input: any, output: any) => {
       if (!MORPH_API_KEY) return;
 
       const messages = output.messages;
+      const nativeCompaction = consumeNativeCompactionArm();
+
+      if (nativeCompaction) {
+        const compactInput = messagesToCompactInput(messages);
+        if (compactInput.length === 0) {
+          await log(
+            "debug",
+            "Native compaction: selected history had no compactable text; using OpenCode compaction unchanged.",
+          );
+          return;
+        }
+
+        await log(
+          "info",
+          `Native compaction: compressing ${messages.length} selected messages (${estimateTotalChars(messages)} chars) before OpenCode writes its persisted summary.`,
+        );
+
+        try {
+          const result = await compactClient!.compact({
+            messages: compactInput,
+            compressionRatio: COMPACT_RATIO,
+            preserveRecent: 0,
+          });
+
+          const compacted = buildCompactedSummaryMessages(messages, result);
+          if (compacted.length === 0) {
+            await log(
+              "warn",
+              "Native compaction: Morph returned an empty summary; using OpenCode compaction unchanged.",
+            );
+            return;
+          }
+
+          const compactedChars = estimateTotalChars(compacted);
+          output.messages = compacted;
+          compactionState = null;
+
+          await log(
+            "info",
+            `Native compaction: Morph compressed ${messages.length} messages -> ${compacted.length} summary (${compactedChars} chars). Ratio: ${formatCompressionPercent(result)}% kept (${result.usage.processing_time_ms}ms)`,
+          );
+          await showToast(
+            "success",
+            `Prepared OpenCode compaction with Morph (${formatCompressionPercent(result)}% kept) | ${result.usage.processing_time_ms}ms`,
+          );
+        } catch (err) {
+          await log(
+            "warn",
+            `Native compaction: Morph compact failed: ${(err as Error).message}. Using OpenCode compaction unchanged.`,
+          );
+        }
+        return;
+      }
 
       // Approximate char threshold — fixed token limit takes precedence
       const charThreshold = COMPACT_TOKEN_LIMIT
@@ -1317,11 +1441,11 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
           await log(
             "info",
-            `Compact (re): ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+            `Compact (re): ${toCompact.length} messages -> ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} -> ${output.messages.length}. Ratio: ${formatCompressionPercent(result)}% kept (${result.usage.processing_time_ms}ms)`,
           );
           await showToast(
             "success",
-            `${toCompact.length} messages re-compacted (${Math.round(result.usage.compression_ratio * 100)}% kept) | ${result.usage.processing_time_ms}ms`,
+            `${toCompact.length} messages re-compacted (${formatCompressionPercent(result)}% kept) | ${result.usage.processing_time_ms}ms`,
           );
         } catch (err) {
           // On failure, use stale frozen block + uncompacted as best-effort
@@ -1378,11 +1502,11 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         //Compact done: ${toCompact.length} msgs → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}`);
         await log(
           "info",
-          `Compact: ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+          `Compact: ${toCompact.length} messages -> ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} -> ${output.messages.length}. Ratio: ${formatCompressionPercent(result)}% kept (${result.usage.processing_time_ms}ms)`,
         );
         await showToast(
           "success",
-          `${toCompact.length} messages compacted (${Math.round(result.usage.compression_ratio * 100)}% kept) | ${result.usage.processing_time_ms}ms`,
+          `${toCompact.length} messages compacted (${formatCompressionPercent(result)}% kept) | ${result.usage.processing_time_ms}ms`,
         );
       } catch (err) {
         //Compact FAILED: ${(err as Error).message}\n${(err as Error).stack}`);
@@ -1393,11 +1517,25 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       }
     };
 
-    // When OpenCode's native compaction triggers, log it
+    // OpenCode's native compaction is the only path that writes a persisted
+    // summary message in current OpenCode versions. Morph compresses the
+    // selected history before that summary model call.
     hooks["experimental.session.compacting"] = async (_input: any, output: any) => {
-      await log("debug", "OpenCode native compaction triggered");
+      if (!MORPH_API_KEY) {
+        output.context.push(
+          "Note: Morph compact plugin is installed, but MORPH_API_KEY is not configured.",
+        );
+        return;
+      }
+
+      armNativeCompaction();
       output.context.push(
-        "Note: Morph compact plugin is active. Older messages may already be compressed.",
+        "Morph compact plugin is active. The selected conversation history will be pre-compressed before this native compaction summary is generated. Treat any Morph-compressed history as authoritative and preserve concrete facts, file paths, commands, errors, constraints, decisions, and remaining work.",
+      );
+
+      await log(
+        "info",
+        "OpenCode native compaction triggered; Morph will pre-compress selected history and OpenCode will persist the summary.",
       );
     };
   }
