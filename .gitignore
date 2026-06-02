@@ -16,8 +16,7 @@ logs/
 .vscode/
 .idea/
 
-# Lockfiles (bun/pnpm — npm uses package-lock.json)
-bun.lock
+# Lockfiles (pnpm — npm uses package-lock.json, bun uses bun.lock)
 pnpm-lock.yaml
 
 # ADV plugin state
