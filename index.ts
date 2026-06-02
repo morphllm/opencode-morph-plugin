@@ -13,8 +13,9 @@ import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 
-// Config from environment — only MORPH_API_KEY is required
-const MORPH_API_KEY = process.env.MORPH_API_KEY;
+// API key from MORPH_API_KEY env var, or the `morph.apiKey` field in
+// opencode config (resolved during plugin init for desktop users).
+let MORPH_API_KEY = process.env.MORPH_API_KEY;
 const MORPH_API_URL = "https://api.morphllm.com";
 const MORPH_TIMEOUT = 30000;
 const MORPH_WARP_GREP_TIMEOUT = 60000;
@@ -75,37 +76,30 @@ const EXISTING_CODE_MARKER = "// ... existing code ...";
 const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
 
 /**
- * Shared MorphClient — FastApply uses morph.fastApply.applyEdit()
- * with MORPH_API_URL passed as per-call override.
+ * Morph SDK clients (FastApply, WarpGrep, Compact). Built by initMorphClients()
+ * once MORPH_API_KEY is known — at module load for the env var, and again during
+ * plugin init if the key comes from opencode config.
  */
-const morph = MORPH_API_KEY
-  ? new MorphClient({
-      apiKey: MORPH_API_KEY,
-      timeout: MORPH_TIMEOUT,
-    })
-  : null;
+let morph: MorphClient | null = null;
+let warpGrep: WarpGrepClient | null = null;
+let compactClient: CompactClient | null = null;
 
-/**
- * Separate WarpGrep client with its own timeout (typically longer than fast apply).
- */
-const warpGrep = MORPH_API_KEY
-  ? new WarpGrepClient({
-      morphApiKey: MORPH_API_KEY,
-      morphApiUrl: MORPH_API_URL,
-      timeout: MORPH_WARP_GREP_TIMEOUT,
-    })
-  : null;
+function initMorphClients() {
+  if (!MORPH_API_KEY) return;
+  morph = new MorphClient({ apiKey: MORPH_API_KEY, timeout: MORPH_TIMEOUT });
+  warpGrep = new WarpGrepClient({
+    morphApiKey: MORPH_API_KEY,
+    morphApiUrl: MORPH_API_URL,
+    timeout: MORPH_WARP_GREP_TIMEOUT,
+  });
+  compactClient = new CompactClient({
+    morphApiKey: MORPH_API_KEY,
+    morphApiUrl: MORPH_API_URL,
+    timeout: MORPH_COMPACT_TIMEOUT,
+  });
+}
 
-/**
- * Separate CompactClient for context compaction.
- */
-const compactClient = MORPH_API_KEY
-  ? new CompactClient({
-      morphApiKey: MORPH_API_KEY,
-      morphApiUrl: MORPH_API_URL,
-      timeout: MORPH_COMPACT_TIMEOUT,
-    })
-  : null;
+initMorphClients();
 
 /**
  * Model context window size in tokens. Updated from chat.params hook.
@@ -751,6 +745,17 @@ const MorphPlugin: Plugin = async ({ directory, worktree, client }) => {
       });
     } catch {}
   };
+
+  // Fall back to the `morph.apiKey` field in opencode config (for desktop
+  // users who can't set env vars). Env var still takes precedence.
+  if (!MORPH_API_KEY) {
+    const cfg = await client.config?.get().catch(() => null);
+    const key = (cfg?.data as { morph?: { apiKey?: string } })?.morph?.apiKey;
+    if (key) {
+      MORPH_API_KEY = key;
+      initMorphClients();
+    }
+  }
 
   if (!MORPH_API_KEY) {
     await log(

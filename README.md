@@ -27,6 +27,15 @@ export MORPH_API_KEY="sk-..."
 
 Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) so it persists.
 
+Alternatively (handy for desktop users who can't set env vars), put the key
+directly in `opencode.json` — the `MORPH_API_KEY` env var takes precedence when both are set:
+
+```json
+{
+  "morph": { "apiKey": "sk-..." }
+}
+```
+
 ### 2. Install the plugin
 
 ```bash
