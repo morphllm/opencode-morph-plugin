@@ -1156,3 +1156,43 @@ describe("formatWarpGrepResult edge cases", () => {
     expect(result).toBe("Search failed: timeout after 60s");
   });
 });
+
+describe("warpgrep_codebase_search result handling", () => {
+  test("awaits the async generator return value (Bun compatibility)", async () => {
+    const fakeResult = {
+      success: true,
+      contexts: [
+        { file: "src/auth.ts", content: "code", lines: [[1, 5]] as Array<[number, number]> },
+      ],
+      summary: "found auth",
+    };
+
+    const original = WarpGrepClient.prototype.execute;
+    // Async generator that returns a result via `return` (not yield).
+    // In Bun, `return value` in an async generator may not auto-await,
+    // so the plugin must explicitly await the final .next() value.
+    WarpGrepClient.prototype.execute = async function* (): AsyncGenerator {
+      return fakeResult;
+    } as any;
+
+    try {
+      const { default: MorphPlugin } = await importPluginWithEnv({
+        MORPH_API_KEY: "sk-test-key",
+      });
+      const hooks = await MorphPlugin(
+        makePluginInput("/tmp/morph-warpgrep-async-test"),
+      );
+      const output = (await hooks.tool.warpgrep_codebase_search.execute(
+        { search_term: "auth flow" },
+        makeToolContext("/tmp/morph-warpgrep-async-test"),
+      )) as string;
+
+      // Without the `await` fix, `value` is a Promise, `result.success` is
+      // undefined, and formatWarpGrepResult returns the generic failure message.
+      expect(output).toContain("Relevant context found:");
+      expect(output).toContain("src/auth.ts");
+    } finally {
+      WarpGrepClient.prototype.execute = original;
+    }
+  });
+});
