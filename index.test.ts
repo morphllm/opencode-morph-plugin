@@ -114,6 +114,8 @@ describe("packaged tool-selection instructions", () => {
     expect(content).toContain("warpgrep_github_search");
     expect(content).toContain("MORPH_API_KEY");
     expect(content).toContain("MORPH_COMPACT_TOKEN_LIMIT");
+    expect(content).toContain("OpenCode native compaction");
+    expect(content).toContain("sidebar");
     expect(content).toContain("opencode.json");
   });
 });
@@ -963,6 +965,103 @@ describe("plugin runtime hooks", () => {
     );
     expect(combined).toContain("Use write for brand new files.");
   });
+
+  test("native session compaction is pre-compressed by Morph while preserving OpenCode prompt anchoring", async () => {
+    const originalCompact = CompactClient.prototype.compact;
+    const logs: any[] = [];
+    const toasts: any[] = [];
+    let capturedCompactArgs: any;
+
+    CompactClient.prototype.compact = async function (args: any) {
+      capturedCompactArgs = args;
+      return {
+        output: "condensed task summary",
+        messages: [{ role: "user", content: "condensed task summary" }],
+        usage: {
+          compression_ratio: 0.2,
+          processing_time_ms: 42,
+          input_tokens: 100,
+          output_tokens: 20,
+        },
+      } as any;
+    };
+
+    try {
+      const { default: MorphPlugin } = await importPluginWithEnv({
+        MORPH_API_KEY: "sk-test-key",
+        MORPH_COMPACT_TOKEN_LIMIT: undefined,
+      });
+
+      const input = makePluginInput("/tmp/morph-plugin") as any;
+      input.client = {
+        app: {
+          log: async ({ body }: any) => {
+            logs.push(body);
+          },
+        },
+        tui: {
+          showToast: async ({ body }: any) => {
+            toasts.push(body);
+          },
+        },
+      };
+
+      const hooks = await MorphPlugin(input);
+      const compactingOutput: { context: string[]; prompt?: string } = {
+        context: [],
+      };
+
+      await hooks["experimental.session.compacting"]?.(
+        { sessionID: "session-test" },
+        compactingOutput,
+      );
+
+      expect(compactingOutput.prompt).toBeUndefined();
+      expect(compactingOutput.context).toHaveLength(1);
+      expect(compactingOutput.context[0]).toContain(
+        "Morph compact plugin is active",
+      );
+      expect(compactingOutput.context[0]).toContain("Morph-compressed history");
+
+      const output = {
+        messages: [
+          makeTextMsg("msg-1", "user", "please refactor auth"),
+          makeTextMsg(
+            "msg-2",
+            "assistant",
+            "read src/auth.ts and found token storage",
+          ),
+        ],
+      };
+
+      await hooks["experimental.chat.messages.transform"]?.({}, output as any);
+
+      expect(capturedCompactArgs.messages).toEqual([
+        { role: "user", content: "please refactor auth" },
+        {
+          role: "assistant",
+          content: "read src/auth.ts and found token storage",
+        },
+      ]);
+      expect(capturedCompactArgs.preserveRecent).toBe(0);
+      expect(output.messages).toHaveLength(1);
+      expect(output.messages[0]!.parts[0]!.type).toBe("text");
+      expect((output.messages[0]!.parts[0] as any).text).toContain(
+        "Morph-compressed conversation history",
+      );
+      expect((output.messages[0]!.parts[0] as any).text).toContain(
+        "condensed task summary",
+      );
+      expect(toasts[0]!.message).toContain(
+        "Prepared OpenCode compaction with Morph",
+      );
+      expect(logs.some((entry) => entry.message.includes("persisted summary"))).toBe(
+        true,
+      );
+    } finally {
+      CompactClient.prototype.compact = originalCompact;
+    }
+  });
 });
 
 describe("ToolContext path resolution", () => {
@@ -1055,5 +1154,45 @@ describe("formatWarpGrepResult edge cases", () => {
 
     const result = await executeSearch({ success: false, error: "timeout after 60s" });
     expect(result).toBe("Search failed: timeout after 60s");
+  });
+});
+
+describe("warpgrep_codebase_search result handling", () => {
+  test("awaits the async generator return value (Bun compatibility)", async () => {
+    const fakeResult = {
+      success: true,
+      contexts: [
+        { file: "src/auth.ts", content: "code", lines: [[1, 5]] as Array<[number, number]> },
+      ],
+      summary: "found auth",
+    };
+
+    const original = WarpGrepClient.prototype.execute;
+    // Async generator that returns a result via `return` (not yield).
+    // In Bun, `return value` in an async generator may not auto-await,
+    // so the plugin must explicitly await the final .next() value.
+    WarpGrepClient.prototype.execute = async function* (): AsyncGenerator {
+      return fakeResult;
+    } as any;
+
+    try {
+      const { default: MorphPlugin } = await importPluginWithEnv({
+        MORPH_API_KEY: "sk-test-key",
+      });
+      const hooks = await MorphPlugin(
+        makePluginInput("/tmp/morph-warpgrep-async-test"),
+      );
+      const output = (await hooks.tool.warpgrep_codebase_search.execute(
+        { search_term: "auth flow" },
+        makeToolContext("/tmp/morph-warpgrep-async-test"),
+      )) as string;
+
+      // Without the `await` fix, `value` is a Promise, `result.success` is
+      // undefined, and formatWarpGrepResult returns the generic failure message.
+      expect(output).toContain("Relevant context found:");
+      expect(output).toContain("src/auth.ts");
+    } finally {
+      WarpGrepClient.prototype.execute = original;
+    }
   });
 });

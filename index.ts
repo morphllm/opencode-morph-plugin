@@ -13,8 +13,9 @@ import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 
-// Config from environment — only MORPH_API_KEY is required
-const MORPH_API_KEY = process.env.MORPH_API_KEY;
+// API key from MORPH_API_KEY env var, or the `morph.apiKey` field in
+// opencode config (resolved during plugin init for desktop users).
+let MORPH_API_KEY = process.env.MORPH_API_KEY;
 const MORPH_API_URL = "https://api.morphllm.com";
 const MORPH_TIMEOUT = 30000;
 const MORPH_WARP_GREP_TIMEOUT = 60000;
@@ -68,7 +69,7 @@ const ALLOW_READONLY_AGENTS =
   process.env.MORPH_ALLOW_READONLY_AGENTS === "true";
 
 /** Plugin version */
-const PLUGIN_VERSION = "2.0.4-rate-per-session-state";
+const PLUGIN_VERSION = "2.0.0";
 
 /**
  * Slash command pattern for manual compaction trigger.
@@ -82,37 +83,30 @@ const EXISTING_CODE_MARKER = "// ... existing code ...";
 const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
 
 /**
- * Shared MorphClient — FastApply uses morph.fastApply.applyEdit()
- * with MORPH_API_URL passed as per-call override.
+ * Morph SDK clients (FastApply, WarpGrep, Compact). Built by initMorphClients()
+ * once MORPH_API_KEY is known — at module load for the env var, and again during
+ * plugin init if the key comes from opencode config.
  */
-const morph = MORPH_API_KEY
-  ? new MorphClient({
-      apiKey: MORPH_API_KEY,
-      timeout: MORPH_TIMEOUT,
-    })
-  : null;
+let morph: MorphClient | null = null;
+let warpGrep: WarpGrepClient | null = null;
+let compactClient: CompactClient | null = null;
 
-/**
- * Separate WarpGrep client with its own timeout (typically longer than fast apply).
- */
-const warpGrep = MORPH_API_KEY
-  ? new WarpGrepClient({
-      morphApiKey: MORPH_API_KEY,
-      morphApiUrl: MORPH_API_URL,
-      timeout: MORPH_WARP_GREP_TIMEOUT,
-    })
-  : null;
+function initMorphClients() {
+  if (!MORPH_API_KEY) return;
+  morph = new MorphClient({ apiKey: MORPH_API_KEY, timeout: MORPH_TIMEOUT });
+  warpGrep = new WarpGrepClient({
+    morphApiKey: MORPH_API_KEY,
+    morphApiUrl: MORPH_API_URL,
+    timeout: MORPH_WARP_GREP_TIMEOUT,
+  });
+  compactClient = new CompactClient({
+    morphApiKey: MORPH_API_KEY,
+    morphApiUrl: MORPH_API_URL,
+    timeout: MORPH_COMPACT_TIMEOUT,
+  });
+}
 
-/**
- * Separate CompactClient for context compaction.
- */
-const compactClient = MORPH_API_KEY
-  ? new CompactClient({
-      morphApiKey: MORPH_API_KEY,
-      morphApiUrl: MORPH_API_URL,
-      timeout: MORPH_COMPACT_TIMEOUT,
-    })
-  : null;
+initMorphClients();
 
 /**
  * Model context window size in tokens. Updated from chat.params hook.
@@ -174,6 +168,24 @@ function sessionIDFromMessages(
   const first = messages[0];
   if (!first) return null;
   return (first.info as { sessionID?: string }).sessionID ?? null;
+}
+
+const NATIVE_COMPACTION_ARM_TTL_MS = 30_000;
+const nativeCompactionArms: number[] = [];
+
+function armNativeCompaction() {
+  nativeCompactionArms.push(Date.now());
+}
+
+function consumeNativeCompactionArm(): boolean {
+  const now = Date.now();
+
+  while (nativeCompactionArms.length > 0) {
+    const armedAt = nativeCompactionArms.shift()!;
+    if (now - armedAt <= NATIVE_COMPACTION_ARM_TTL_MS) return true;
+  }
+
+  return false;
 }
 
 /**
@@ -306,6 +318,47 @@ function estimateTotalChars(
   return total;
 }
 
+function formatCompressionPercent(result: CompactResult): number {
+  return Math.round(result.usage.compression_ratio * 100);
+}
+
+function compactResultText(result: CompactResult): string {
+  const output = result.output?.trim();
+  if (output) return output;
+
+  return result.messages
+    .map((message) => `[${message.role}] ${message.content}`)
+    .join("\n\n")
+    .trim();
+}
+
+function buildCompactedSummaryMessages(
+  originalMessages: { info: Message; parts: Part[] }[],
+  result: CompactResult,
+): { info: Message; parts: Part[] }[] {
+  if (originalMessages.length === 0) return [];
+
+  const template = originalMessages[0]!;
+  const last = originalMessages[originalMessages.length - 1]!;
+  const summary = compactResultText(result);
+
+  if (!summary) return [];
+
+  return [
+    {
+      info: { ...template.info } as Message,
+      parts: [
+        {
+          id: `morph-compact-summary-${template.info.id}-${last.info.id}`,
+          sessionID: template.info.sessionID,
+          messageID: template.info.id,
+          type: "text" as const,
+          text: `Morph-compressed conversation history:\n\n${summary}`,
+        } as TextPart,
+      ],
+    },
+  ];
+}
 
 function resolveSessionFilepath(
   targetFilepath: string,
@@ -784,6 +837,17 @@ const MorphPlugin: Plugin = async ({ directory, worktree, client }) => {
     } catch {}
   };
 
+  // Fall back to the `morph.apiKey` field in opencode config (for desktop
+  // users who can't set env vars). Env var still takes precedence.
+  if (!MORPH_API_KEY) {
+    const cfg = await client.config?.get().catch(() => null);
+    const key = (cfg?.data as { morph?: { apiKey?: string } })?.morph?.apiKey;
+    if (key) {
+      MORPH_API_KEY = key;
+      initMorphClients();
+    }
+  }
+
   if (!MORPH_API_KEY) {
     await log(
       "warn",
@@ -1073,7 +1137,11 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
             for (;;) {
               const { value, done } = await generator.next();
               if (done) {
-                result = value;
+                // Bun: morphsdk's async generator returns an unawaited Promise
+                // from processAgentResult() via `return promise`. Node.js
+                // auto-awaits it per spec, but Bun does not. Explicitly await
+                // so the resolved WarpGrepResult is used instead of a Promise.
+                result = await value as WarpGrepResult;
                 break;
               }
               turnCount = value.turn;
@@ -1369,6 +1437,21 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       }
     };
 
+    // OpenCode finished its own native compaction for a session — that
+    // session's frozen block is now stale. Drop it (and any expired
+    // native-compaction arms) so the next turn rebuilds from the freshly
+    // summarized history. Keyed by session so sibling sessions keep theirs.
+    hooks.event = async ({ event }: any) => {
+      if (event?.type !== "session.compacted") return;
+      const sid = event.properties?.sessionID;
+      if (sid) compactionStateBySession.delete(sid);
+      nativeCompactionArms.length = 0;
+      await log(
+        "info",
+        `OpenCode native compaction completed${sid ? ` (session ${sid})` : ""}; cleared Morph transient compaction state.`,
+      );
+    };
+
     // Capture model context window from chat.params (fires every LLM call)
     hooks["chat.params"] = async (input: any) => {
       //chat.params CALLED: model=${input.model?.id}, context=${input.model?.limit?.context}`);
@@ -1377,19 +1460,74 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       }
     };
 
-    // Compaction: compress older messages via Morph, then FREEZE the result.
-    // The frozen block is reused byte-for-byte on every subsequent call,
-    // preserving the LLM provider's prompt prefix cache.
-    // Re-compaction only fires when the threshold is crossed again.
+    // Compaction: current OpenCode calls this during native session compaction.
+    // When armed by experimental.session.compacting, Morph reduces the selected
+    // history to a single summary before OpenCode writes its persisted summary.
+    // The fallback path below preserves the older proactive/frozen behavior for
+    // OpenCode versions that call this hook before normal LLM turns.
     hooks["experimental.chat.messages.transform"] = async (_input: any, output: any) => {
       if (!MORPH_API_KEY) return;
 
       const messages = output.messages;
-
-      // Resolve current session FIRST. Without a sessionID we cannot safely
-      // touch compactionStateBySession, so we degrade to "do nothing" — that
-      // is strictly better than reading another session's state.
       const sessionID = sessionIDFromMessages(messages);
+      const nativeCompaction = consumeNativeCompactionArm();
+
+      if (nativeCompaction) {
+        const compactInput = messagesToCompactInput(messages);
+        if (compactInput.length === 0) {
+          await log(
+            "debug",
+            "Native compaction: selected history had no compactable text; using OpenCode compaction unchanged.",
+          );
+          return;
+        }
+
+        await log(
+          "info",
+          `Native compaction: compressing ${messages.length} selected messages (${estimateTotalChars(messages)} chars) before OpenCode writes its persisted summary.`,
+        );
+
+        try {
+          const result = await compactClient!.compact({
+            messages: compactInput,
+            compressionRatio: COMPACT_RATIO,
+            preserveRecent: 0,
+          });
+
+          const compacted = buildCompactedSummaryMessages(messages, result);
+          if (compacted.length === 0) {
+            await log(
+              "warn",
+              "Native compaction: Morph returned an empty summary; using OpenCode compaction unchanged.",
+            );
+            return;
+          }
+
+          const compactedChars = estimateTotalChars(compacted);
+          replaceMessages(output, compacted);
+          if (sessionID) compactionStateBySession.delete(sessionID);
+
+          await log(
+            "info",
+            `Native compaction: Morph compressed ${messages.length} messages -> ${compacted.length} summary (${compactedChars} chars). Ratio: ${formatCompressionPercent(result)}% kept (${result.usage.processing_time_ms}ms)`,
+          );
+          await showToast(
+            "success",
+            `Prepared OpenCode compaction with Morph (${formatCompressionPercent(result)}% kept) | ${result.usage.processing_time_ms}ms`,
+          );
+        } catch (err) {
+          await log(
+            "warn",
+            `Native compaction: Morph compact failed: ${(err as Error).message}. Using OpenCode compaction unchanged.`,
+          );
+        }
+        return;
+      }
+
+      // The threshold/frozen path keys all state by session. Without a
+      // sessionID we cannot safely touch compactionStateBySession, so we
+      // degrade to "do nothing" — strictly better than reading another
+      // session's state. (Native compaction above already ran if armed.)
       if (!sessionID) return;
 
       const compactionState = compactionStateBySession.get(sessionID) ?? null;
@@ -1471,11 +1609,11 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
 
           await log(
             "info",
-            `Compact (re): session=${sessionID} ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+            `Compact (re): session=${sessionID} ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${formatCompressionPercent(result)}% kept (${result.usage.processing_time_ms}ms)`,
           );
           await showToast(
             "success",
-            `${toCompact.length} messages re-compacted (${Math.round(result.usage.compression_ratio * 100)}% kept) | ${result.usage.processing_time_ms}ms`,
+            `${toCompact.length} messages re-compacted (${formatCompressionPercent(result)}% kept) | ${result.usage.processing_time_ms}ms`,
           );
         } catch (err) {
           // On failure, use stale frozen block + uncompacted as best-effort
@@ -1532,11 +1670,11 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
         //Compact done: ${toCompact.length} msgs → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}`);
         await log(
           "info",
-          `Compact: session=${sessionID} ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${Math.round(result.usage.compression_ratio * 100)}% kept (${result.usage.processing_time_ms}ms)`,
+          `Compact: session=${sessionID} ${toCompact.length} messages → ${frozen.length} frozen (${frozenChars} chars). Messages: ${beforeLen} → ${output.messages.length}. Ratio: ${formatCompressionPercent(result)}% kept (${result.usage.processing_time_ms}ms)`,
         );
         await showToast(
           "success",
-          `${toCompact.length} messages compacted (${Math.round(result.usage.compression_ratio * 100)}% kept) | ${result.usage.processing_time_ms}ms`,
+          `${toCompact.length} messages compacted (${formatCompressionPercent(result)}% kept) | ${result.usage.processing_time_ms}ms`,
         );
       } catch (err) {
         //Compact FAILED: ${(err as Error).message}\n${(err as Error).stack}`);
@@ -1547,11 +1685,25 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
       }
     };
 
-    // When OpenCode's native compaction triggers, log it
+    // OpenCode's native compaction is the only path that writes a persisted
+    // summary message in current OpenCode versions. Morph compresses the
+    // selected history before that summary model call.
     hooks["experimental.session.compacting"] = async (_input: any, output: any) => {
-      await log("debug", "OpenCode native compaction triggered");
+      if (!MORPH_API_KEY) {
+        output.context.push(
+          "Note: Morph compact plugin is installed, but MORPH_API_KEY is not configured.",
+        );
+        return;
+      }
+
+      armNativeCompaction();
       output.context.push(
-        "Note: Morph compact plugin is active. Older messages may already be compressed.",
+        "Morph compact plugin is active. The selected conversation history will be pre-compressed before this native compaction summary is generated. Treat any Morph-compressed history as authoritative and preserve concrete facts, file paths, commands, errors, constraints, decisions, and remaining work.",
+      );
+
+      await log(
+        "info",
+        "OpenCode native compaction triggered; Morph will pre-compress selected history and OpenCode will persist the summary.",
       );
     };
   }
