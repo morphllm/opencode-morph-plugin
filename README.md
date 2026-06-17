@@ -69,7 +69,7 @@ You should see `morph_edit`, `warpgrep_codebase_search`, and `warpgrep_github_se
 
 ## Compaction
 
-Context compression via the Morph Compact API. In current OpenCode 1.14.x releases, only OpenCode native compaction writes the persisted summary message that future turns and the sidebar use. This plugin handles that path by pre-compressing the selected history with Morph before OpenCode's native compaction model writes its summary.
+Context compression via the Morph Compact API. In current OpenCode releases (1.14+), only OpenCode native compaction writes the persisted summary message that future turns and the sidebar use. This plugin handles that path by pre-compressing the selected history with Morph before OpenCode's native compaction model writes its summary.
 
 ### How it works
 
