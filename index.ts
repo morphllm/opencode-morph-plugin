@@ -1046,7 +1046,11 @@ Get your API key at: https://morphllm.com/dashboard/api-keys`;
             for (;;) {
               const { value, done } = await generator.next();
               if (done) {
-                result = value;
+                // Bun: morphsdk's async generator returns an unawaited Promise
+                // from processAgentResult() via `return promise`. Node.js
+                // auto-awaits it per spec, but Bun does not. Explicitly await
+                // so the resolved WarpGrepResult is used instead of a Promise.
+                result = await value as WarpGrepResult;
                 break;
               }
               turnCount = value.turn;
