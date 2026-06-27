@@ -15,6 +15,19 @@ On production repos and SWE-Bench Pro, enabling WarpGrep and compaction improves
 
 ---
 
+## Which Morph integration should I use?
+
+**On OpenCode, use this plugin** — not the `@morphllm/morphmcp` MCP server. This plugin is the only integration that includes context **compaction** and automatic **tool routing**, because those rely on OpenCode plugin hooks that the MCP protocol cannot expose.
+
+| Harness | Use | Compaction | Tool routing |
+|---------|-----|------------|--------------|
+| **OpenCode** | this plugin (`@morphllm/opencode-morph-plugin`) | ✅ | ✅ |
+| Cursor, Claude Code, VS Code, Windsurf, Zed, any MCP host | [`@morphllm/morphmcp`](https://www.npmjs.com/package/@morphllm/morphmcp) | ❌ (protocol limit) | ❌ |
+
+If you're on OpenCode and were setting up the MCP server, switch to this plugin — you get the same Fast Apply + WarpGrep + GitHub search tools, plus compaction.
+
+---
+
 ## Quick Start
 
 ### 1. Get a Morph API key

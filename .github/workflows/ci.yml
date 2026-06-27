@@ -29,3 +29,41 @@ jobs:
 
       - name: Build
         run: bun run build
+
+  consumer-install:
+    name: Consumer install (npm + bun)
+    runs-on: ubuntu-latest
+    # Catches dependency-resolution breakage a real user hits at install time —
+    # e.g. a transitive pin to a nonexistent/too-new version (the @opentelemetry
+    # ETARGET class). bun's resolver can mask what npm rejects, so we run both.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build and pack the plugin
+        run: |
+          bun install
+          bun run build
+          npm pack
+          echo "TARBALL=$(ls morphllm-opencode-morph-plugin-*.tgz)" >> "$GITHUB_ENV"
+
+      - name: Install into a clean project with npm
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer-npm" && cd "$RUNNER_TEMP/consumer-npm"
+          npm init -y >/dev/null 2>&1
+          npm install "$GITHUB_WORKSPACE/$TARBALL"
+          node -e "require('fs').accessSync('node_modules/@morphllm/opencode-morph-plugin/package.json'); console.log('npm consumer install OK')"
+
+      - name: Install into a clean project with bun
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer-bun" && cd "$RUNNER_TEMP/consumer-bun"
+          echo '{"name":"consumer","version":"1.0.0","private":true}' > package.json
+          bun add "$GITHUB_WORKSPACE/$TARBALL"
+          node -e "require('fs').accessSync('node_modules/@morphllm/opencode-morph-plugin/package.json'); console.log('bun consumer install OK')"
