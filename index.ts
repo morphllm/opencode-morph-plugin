@@ -68,8 +68,8 @@ const READONLY_AGENTS = ["plan", "explore"];
 const ALLOW_READONLY_AGENTS =
   process.env.MORPH_ALLOW_READONLY_AGENTS === "true";
 
-/** Plugin version */
-const PLUGIN_VERSION = "2.0.0";
+/** Plugin version. Kept in sync with package.json by the release workflow. */
+const PLUGIN_VERSION = "2.0.15";
 
 /**
  * Slash command pattern for manual compaction trigger.

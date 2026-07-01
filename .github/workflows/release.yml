@@ -51,10 +51,7 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Build
-        run: bun run build
-
-      - name: Bump version
+      - name: Bump version & sync plugin constant
         id: version
         run: |
           git config --global user.name "github-actions[bot]"
@@ -67,7 +64,21 @@ jobs:
           NEW_VERSION=$(node -p "require('./package.json').version")
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
-          git add package.json
+          # Keep the PLUGIN_VERSION constant in index.ts in sync with package.json
+          # so logs and tool metadata report the real version (was frozen at 2.0.0
+          # because the bump only touched package.json). Build runs after this.
+          sed -i -E "s/(const PLUGIN_VERSION = \")[^\"]*(\";)/\1${NEW_VERSION}\2/" index.ts
+          grep -q "const PLUGIN_VERSION = \"${NEW_VERSION}\";" index.ts || {
+            echo "::error::Failed to sync PLUGIN_VERSION in index.ts to ${NEW_VERSION}"; exit 1;
+          }
+
+      - name: Build
+        run: bun run build
+
+      - name: Commit, tag & push
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.new_version }}"
+          git add package.json package-lock.json index.ts
           git commit -m "chore: bump to $NEW_VERSION [skip ci]"
           git tag -f "v$NEW_VERSION"
           git push origin main --tags --force

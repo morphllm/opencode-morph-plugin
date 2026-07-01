@@ -21,9 +21,9 @@
     "ci": "bun test && bun run build && bun run typecheck"
   },
   "dependencies": {
-    "@morphllm/morphsdk": "0.2.173",
-    "@opencode-ai/plugin": "latest",
-    "@opencode-ai/sdk": "^1.2.22"
+    "@morphllm/morphsdk": "0.2.180",
+    "@opencode-ai/plugin": "^1.17.7",
+    "@opencode-ai/sdk": "^1.17.7"
   },
   "devDependencies": {
     "bun-types": "latest",
