@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Startup hang without `MORPH_API_KEY`** — plugin init awaited `client.config.get()` while OpenCode/Kilo were still resolving config, deadlocking startup ([#28](https://github.com/morphllm/opencode-morph-plugin/issues/28)). The config-file key is now read from plugin options, which the host passes at init: `"plugin": [["@morphllm/opencode-morph-plugin", { "apiKey": "sk-..." }]]`. The old top-level `"morph": { "apiKey" }` form never reached the plugin (OpenCode strips unknown keys) and makes Kilo reject the config file.
+
 ## [2.0.3] - 2026-03-16
 
 ### Fixed

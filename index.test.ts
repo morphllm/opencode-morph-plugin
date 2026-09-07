@@ -942,6 +942,72 @@ describe("plugin runtime hooks", () => {
     );
   });
 
+  test("init never round-trips to the host config endpoint (startup deadlock guard)", async () => {
+    const { default: MorphPlugin } = await importPluginWithEnv({
+      MORPH_API_KEY: undefined,
+    });
+
+    // OpenCode/Kilo initialize plugins while still resolving config, so a
+    // client.config.get() call from init blocks forever. Simulate that.
+    const input = makePluginInput("/tmp/morph-plugin") as any;
+    input.client.config = { get: () => new Promise(() => {}) };
+
+    const hooks = await Promise.race([
+      MorphPlugin(input),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("plugin init hung")), 2000),
+      ),
+    ]);
+
+    expect(hooks.tool).toBeDefined();
+  });
+
+  test("apiKey plugin option enables the tools when the env var is unset", async () => {
+    const { default: MorphPlugin } = await importPluginWithEnv({
+      MORPH_API_KEY: undefined,
+    });
+    const logs: any[] = [];
+    const input = makePluginInput("/tmp/morph-plugin") as any;
+    input.client.app.log = async ({ body }: any) => {
+      logs.push(body);
+    };
+
+    const hooks = await MorphPlugin(input, { apiKey: "sk-from-config" });
+
+    expect(logs.some((l) => l.level === "info" && l.message.includes("loaded"))).toBe(true);
+    expect(logs.some((l) => l.level === "warn")).toBe(false);
+
+    const system = { system: [] as string[] };
+    await hooks["experimental.chat.system.transform"]?.({ sessionID: "s", model: {} }, system);
+    expect(system.system.join("\n")).toContain(
+      "Prefer morph_edit for large or scattered edits inside existing files.",
+    );
+
+    const definition = { description: "Base description", parameters: {} };
+    await hooks["tool.definition"]?.({ toolID: "morph_edit" }, definition);
+    expect(definition.description).not.toContain("Currently unavailable");
+  });
+
+  test("warns at init when no key is configured anywhere", async () => {
+    const { default: MorphPlugin } = await importPluginWithEnv({
+      MORPH_API_KEY: undefined,
+    });
+    const logs: any[] = [];
+    const input = makePluginInput("/tmp/morph-plugin") as any;
+    input.client.app.log = async ({ body }: any) => {
+      logs.push(body);
+    };
+
+    await MorphPlugin(input, {});
+
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        level: "warn",
+        message: "MORPH_API_KEY not set - morph tools will be disabled",
+      }),
+    );
+  });
+
   test("system transform injects concise morph routing guidance", async () => {
     const { default: MorphPlugin } = await importPluginWithEnv({
       MORPH_API_KEY: "sk-test-key",

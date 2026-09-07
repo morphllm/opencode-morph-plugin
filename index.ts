@@ -13,8 +13,8 @@ import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 
-// API key from MORPH_API_KEY env var, or the `morph.apiKey` field in
-// opencode config (resolved during plugin init for desktop users).
+// API key from MORPH_API_KEY env var, or the `apiKey` plugin option in
+// opencode config: `"plugin": [["@morphllm/opencode-morph-plugin", { "apiKey": "sk-..." }]]`.
 let MORPH_API_KEY = process.env.MORPH_API_KEY;
 const MORPH_API_URL = "https://api.morphllm.com";
 const MORPH_TIMEOUT = 30000;
@@ -84,8 +84,8 @@ const MORPH_ROUTING_HINT_HEADER = "Morph plugin routing hints:";
 
 /**
  * Morph SDK clients (FastApply, WarpGrep, Compact). Built by initMorphClients()
- * once MORPH_API_KEY is known — at module load for the env var, and again during
- * plugin init if the key comes from opencode config.
+ * once MORPH_API_KEY is known — at module load for the env var, and again at
+ * plugin init if the key comes from the plugin options in opencode config.
  */
 let morph: MorphClient | null = null;
 let warpGrep: WarpGrepClient | null = null;
@@ -808,7 +808,7 @@ async function fetchGitHubRepoSuggestions(
   });
 }
 
-const MorphPlugin: Plugin = async ({ directory, worktree, client }) => {
+const MorphPlugin: Plugin = async ({ directory, worktree, client }, options) => {
   const log = async (
     level: "debug" | "info" | "warn" | "error",
     message: string,
@@ -837,22 +837,18 @@ const MorphPlugin: Plugin = async ({ directory, worktree, client }) => {
     } catch {}
   };
 
-  // Fall back to the `morph.apiKey` field in opencode config (for desktop
-  // users who can't set env vars). Env var still takes precedence.
-  if (!MORPH_API_KEY) {
-    const cfg = await client.config?.get().catch(() => null);
-    const key = (cfg?.data as { morph?: { apiKey?: string } })?.morph?.apiKey;
-    if (key) {
-      MORPH_API_KEY = key;
-      initMorphClients();
-    }
+  // Fall back to the `apiKey` plugin option (for desktop users who can't set
+  // env vars). Env var still takes precedence. Plugins are initialized while
+  // the host is still resolving its config, so this must come from the options
+  // the host hands us — never from client.config.get(), which deadlocks
+  // OpenCode/Kilo startup.
+  if (!MORPH_API_KEY && typeof options?.apiKey === "string" && options.apiKey) {
+    MORPH_API_KEY = options.apiKey;
+    initMorphClients();
   }
 
   if (!MORPH_API_KEY) {
-    await log(
-      "warn",
-      "MORPH_API_KEY not set - morph tools will be disabled",
-    );
+    await log("warn", "MORPH_API_KEY not set - morph tools will be disabled");
   } else {
     const features = [
       MORPH_EDIT_ENABLED && "edit",

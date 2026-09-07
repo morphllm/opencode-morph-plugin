@@ -40,14 +40,17 @@ export MORPH_API_KEY="sk-..."
 
 Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) so it persists.
 
-Alternatively (handy for desktop users who can't set env vars), put the key
-directly in `opencode.json` — the `MORPH_API_KEY` env var takes precedence when both are set:
+Alternatively (handy for desktop users who can't set env vars), pass the key
+as a plugin option in `opencode.json` — the `MORPH_API_KEY` env var takes precedence when both are set:
 
 ```json
 {
-  "morph": { "apiKey": "sk-..." }
+  "plugin": [["@morphllm/opencode-morph-plugin", { "apiKey": "sk-..." }]]
 }
 ```
+
+Do not add a top-level `"morph"` key to the config: OpenCode drops unknown keys
+and Kilo rejects the whole config file.
 
 ### 2. Install the plugin
 
@@ -75,6 +78,8 @@ Edit `~/.config/opencode/opencode.json`:
 ```bash
 opencode
 ```
+
+The same config works for [Kilo CLI](https://kilo.ai) (`kilo.jsonc` / `opencode.json`).
 
 You should see `morph_edit`, `warpgrep_codebase_search`, and `warpgrep_github_search` in the available tools. Compaction runs automatically in the background.
 
