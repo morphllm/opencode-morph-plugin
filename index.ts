@@ -11,6 +11,7 @@ import { type Plugin, tool } from "@opencode-ai/plugin";
 import { MorphClient, WarpGrepClient, CompactClient } from "@morphllm/morphsdk";
 import type { WarpGrepResult, CompactResult } from "@morphllm/morphsdk";
 import type { Part, TextPart, ToolPart, Message } from "@opencode-ai/sdk";
+import { readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 
 // API key from MORPH_API_KEY env var, or the `apiKey` plugin option in
@@ -367,6 +368,14 @@ function resolveSessionFilepath(
   return isAbsolute(targetFilepath)
     ? targetFilepath
     : resolvePath(sessionDirectory, targetFilepath);
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as { code?: string }).code === "ENOENT"
+  );
 }
 
 function resolveSessionRepoRoot(
@@ -948,19 +957,25 @@ Alternatively, use the native 'edit' tool for this change.`;
           // Read the original file
           let originalCode: string;
           try {
-            const file = Bun.file(filepath);
-            if (!(await file.exists())) {
-              if (!normalizedCodeEdit.includes(EXISTING_CODE_MARKER)) {
-                await Bun.write(filepath, normalizedCodeEdit);
-                return `Created new file: ${target_filepath}\n\nLines: ${normalizedCodeEdit.split("\n").length}`;
-              }
-              return `Error: File not found: ${target_filepath}
+            originalCode = await readFile(filepath, "utf8");
+          } catch (err) {
+            if (isFileNotFoundError(err)) {
+              if (normalizedCodeEdit.includes(EXISTING_CODE_MARKER)) {
+                return `Error: File not found: ${target_filepath}
 
 The file doesn't exist and the code_edit contains lazy markers.
 For new files, provide the complete content without "${EXISTING_CODE_MARKER}" markers.`;
+              }
+
+              try {
+                await writeFile(filepath, normalizedCodeEdit, "utf8");
+              } catch (writeErr) {
+                const error = writeErr as Error;
+                return `Error writing file ${target_filepath}: ${error.message}`;
+              }
+              return `Created new file: ${target_filepath}\n\nLines: ${normalizedCodeEdit.split("\n").length}`;
             }
-            originalCode = await file.text();
-          } catch (err) {
+
             const error = err as Error;
             return `Error reading file ${target_filepath}: ${error.message}`;
           }
@@ -1068,7 +1083,7 @@ Options:
 
           // Write the merged result
           try {
-            await Bun.write(filepath, mergedCode);
+            await writeFile(filepath, mergedCode, "utf8");
           } catch (err) {
             const error = err as Error;
             return `Error writing file ${target_filepath}: ${error.message}`;

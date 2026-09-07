@@ -1155,6 +1155,14 @@ describe("ToolContext path resolution", () => {
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });
+
+  test("morph_edit file IO avoids Bun runtime globals", () => {
+    const source = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
+
+    expect(source).toContain('from "node:fs/promises"');
+    expect(source).not.toContain("Bun.file");
+    expect(source).not.toContain("Bun.write");
+  });
 });
 
 describe("formatWarpGrepResult edge cases", () => {
